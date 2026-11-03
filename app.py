@@ -1,4 +1,4 @@
-import os, re, html, gzip, json, time, math, struct, hmac, hashlib, random, asyncio, sqlite3, logging, collections, datetime as dt
+import os, re, html, base64, gzip, json, time, math, struct, hmac, hashlib, random, asyncio, sqlite3, logging, collections, datetime as dt
 from zoneinfo import ZoneInfo
 import httpx
 from fastapi import FastAPI, Request
@@ -33,6 +33,7 @@ create table if not exists posts(id integer primary key autoincrement,at text,te
 create table if not exists seen(uid int,key text,primary key(uid,key));
 create table if not exists inv(name text primary key,qty int);
 create table if not exists settings(k text primary key,v text);
+create table if not exists accs(nick text primary key);
 create table if not exists logs(id integer primary key autoincrement,line text);"""
 db.executescript(SCHEMA)
 def flush_logs():
@@ -50,12 +51,13 @@ def q(sql, *a):
 
 STAT = {"cache": 0, "llm": 0, "bot": "not started", "err": ""}
 cool, cache, hist_pref, pending, ipc = {}, collections.OrderedDict(), {}, {}, {}
-FREE = []
+FREE, VISION = [], []
 
 SYS = {
  "chat": "Ты MY_AI, ассистент в Telegram и на сайте. Стиль: лаконичный терминальный, можно метки в квадратных скобках. "
          "Отвечай на языке пользователя, коротко и по делу. Не предлагай взлом, обход защиты и подобное. "
          "Если приходится остановиться из-за лимита, выдай отчёт: [COMPLETED], [FILE GENERATED], [LIMIT REACHED PREEMPTIVELY], [NEXT STEPS].",
+ "vision": "Ты MY_AI. Тебе присылают изображения. Опиши и разбери то, что видишь, по запросу пользователя. Отвечай на его языке, коротко и по делу.",
  "coder": "Ты Агент-Кодер: пишешь и дорабатываешь код, отвечаешь кратко, код в блоках. Без воды.",
  "optimizer": "Ты Агент-Оптимизатор: сжимаешь текст без потери фактов, максимально коротко.",
 }
@@ -66,11 +68,13 @@ def route(t): return "coder" if CODE.search(t) else "chat"
 
 # ---------- Free models + key pool ----------
 async def refresh_models():
-    global FREE
+    global FREE, VISION
     try:
         async with httpx.AsyncClient(timeout=30) as c: d = (await c.get(OR + "/models")).json()["data"]
         FREE = [m["id"] for m in sorted((m for m in d if m["id"].endswith(":free")), key=lambda m: -(m.get("context_length") or 0))]
-        log.info("free models: %d", len(FREE))
+        VISION = [m["id"] for m in sorted((m for m in d if m["id"].endswith(":free") and "image" in ((m.get("architecture") or {}).get("input_modalities") or [])),
+                                          key=lambda m: -(m.get("context_length") or 0))]
+        log.info("free models: %d, with vision: %d", len(FREE), len(VISION))
     except Exception as e: log.error("models: %r", e)
 
 def keys_for(uid):
@@ -78,7 +82,7 @@ def keys_for(uid):
     return env + [k for (k,) in q("select key from keys where owner in (0,?)", uid)]
 
 def models_for(role):
-    ms = [m for m in FREE if cool.get(m, 0) <= time.time()]
+    ms = [m for m in (VISION if role == "vision" else FREE) if cool.get(m, 0) <= time.time()]
     p = [m for m in ms if any(x in m.lower() for x in PREF.get(role, ()))]
     return (p + [m for m in ms if m not in p])[:4]
 
@@ -193,16 +197,61 @@ async def mc(uid, desc):
 
 # ---------- PS99 ----------
 rap_prev = {}
-async def rap_load():
-    async with httpx.AsyncClient(timeout=30) as c: d = (await c.get("https://ps99.biggamesapi.io/api/rap")).json()["data"]
-    return {f'{x["configData"]["id"]} pt{x["configData"].get("pt", 0)}': x.get("value", 0) for x in d}
+PT = {0: "", 1: " Golden", 2: " Rainbow"}
+def rap_label(x):
+    c, cat = x.get("configData") or {}, x.get("category", "")
+    name = str(c.get("id", "?")) + PT.get(c.get("pt", 0), f" pt{c.get('pt')}")
+    if c.get("sh"): name += " Shiny"
+    if c.get("tn"): name += f" T{c['tn']}"
+    return name if cat == "Pet" else f"{name} [{cat}]"
+
+async def api_get(path):
+    async with httpx.AsyncClient(timeout=40) as c: return (await c.get("https://ps99.biggamesapi.io" + path)).json()
+async def rap_load(): return {rap_label(x): x.get("value", 0) for x in (await api_get("/api/rap"))["data"]}
+async def exists_load(): return {rap_label(x): x.get("value", 0) for x in (await api_get("/api/exists"))["data"]}
+
+def short(v): return f"{v / 1e12:.2f}T" if v >= 1e12 else f"{v / 1e9:.1f}B" if v >= 1e9 else f"{v / 1e6:.1f}M" if v >= 1e6 else f"{v:,}"
 
 async def ps99():
     try: d = await rap_load()
     except Exception as e: return f"[PS99 ERROR] API недоступен: {e!r}"
     top = sorted(d.items(), key=lambda x: -x[1])[:10]
-    t = "\n".join(f"{k}: {v:,}" for k, v in top)
-    return "[PS99 RAP TOP-10]\n" + t + "\n\n" + await llm([{"role": "user", "content": "Дай 2 коротких вывода по рынку PS99:\n" + t}], "chat")
+    t = "\n".join(f"{k}: {short(v)}" for k, v in top)
+    return "[PS99 RAP TOP-10]\n" + t + "\n\n" + await llm([{"role": "user", "content": "Единицы: T = триллион, B = миллиард. Не меняй единицы и не выдумывай цифры. Дай 2 коротких вывода по рынку PS99:\n" + t}], "chat")
+
+async def inv_report(nick):
+    try:
+        d = await api_get(f"/v1/players/{nick}?include=inventory")
+        if d.get("status") != "ok": return f"[{nick}] не найден или нет публичных данных. Привяжи Roblox на db.biggames.io и открой инвентарь.", None
+        v = (d["data"].get("views") or {}).get("inventory") or {}
+        if not v.get("available"): return f"[{nick}] инвентарь скрыт ({v.get('reason', '?')}). Открой его в настройках на db.biggames.io.", None
+        items = v["data"]["items"]
+    except Exception as e: return f"[{nick}] [ERROR] {e!r}", None
+    rows = sorted(((i.get("displayName") or i.get("id"), i.get("variant"), i.get("count", 1), (i.get("rap") or 0) * (i.get("count") or 1)) for i in items), key=lambda x: -x[3])
+    tot = sum(x[3] for x in rows)
+    return f"[{nick}] RAP: {short(tot)}, предметов: {len(items)}\n" + "\n".join(f"{n}{' ' + vr if vr else ''} x{c}: {short(val)}" for n, vr, c, val in rows[:12]), tot
+
+NEWCOLS = ("Pets", "Eggs", "Hoverboards", "Booths", "Lootboxes", "Enchants", "Currency", "MiscItems")
+async def ps99_new():
+    out = []
+    for col in NEWCOLS:
+        try: names = {x.get("configName") for x in (await api_get("/api/collection/" + col))["data"] if x.get("configName")}
+        except Exception: continue
+        old = q("select v from settings where k=?", "col:" + col); prev = set(json.loads(old[0][0])) if old else None
+        if prev is not None and names - prev:
+            new = sorted(names - prev); out.append(f"{col}: " + ", ".join(new[:15]) + (f" (+{len(new) - 15})" if len(new) > 15 else ""))
+        if prev is None or names != prev: q("insert or replace into settings values(?,?)", "col:" + col, json.dumps(sorted(names)))
+    if out: await say(ADMIN, "[PS99 НОВОЕ]\n" + "\n".join(out))
+
+async def ps99_watch():
+    for (n,) in q("select nick from accs"):
+        _, tot = await inv_report(n)
+        if tot is None: continue
+        old = q("select v from settings where k=?", "invtot:" + n)
+        if not old or old[0][0] != str(tot):
+            q("insert or replace into settings values(?,?)", "invtot:" + n, str(tot))
+            if old and float(old[0][0]) > 0 and abs(tot - float(old[0][0])) / float(old[0][0]) > 0.02: await say(ADMIN, f"[INV] {n}: {short(int(float(old[0][0])))} -> {short(tot)}")
+    if dt.datetime.now(MSK).hour % 3 == 0: await ps99_new()
 
 async def ps99_movers():
     global rap_prev
@@ -220,8 +269,9 @@ async def digest():
     t = re.findall(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", xml)[1:9]
     return await llm([{"role": "user", "content": "Сделай короткую сводку:\n" + "\n".join(t)}], "optimizer")
 
-VERSION = "1.6.1"
-CHANGELOG = ["1.6: до 5 копий базы в двух местах, автовыбор свежей и запасной, логи сохраняются",
+VERSION = "1.7"
+CHANGELOG = ["1.7: фото, живой инвентарь PS99, исправлены цены, слежение за новым",
+             "1.6: до 5 копий базы в двух местах, автовыбор свежей и запасной, логи сохраняются",
              "1.5: отдельный бот для бэкапов (/setbackup, /admin bots)",
              "1.4: база сама восстанавливается после перезапуска",
              "1.3: объявления от админа всем (сразу или по расписанию)",
@@ -338,9 +388,9 @@ async def say(chat, text, token=None, **kw):
 
 HELP = ("[MY_AI] Просто пиши, отвечу.\n\nНовости:\n/news - свежее из источников\n/sources - список\n/addsource ссылка - добавить (RSS, @канал Telegram, YouTube)\n"
         "/delsource N - удалить\n/sub on|off - рассылка\n/time 09:00 21:00 - когда слать (МСК)\n/format ai|short - с кратким пересказом или только заголовки\n/updates - что нового\n\n"
-        "Другое: /key add|list|del - свой ключ OpenRouter, /agent coder|chat|auto, /link, /clear, /migrate_chat\n"
+        "Фото: пришли картинку с подписью-вопросом, разберу.\n/nick имя1 имя2 - свободны ли ники Minecraft.\nДругое: /key add|list|del - свой ключ OpenRouter, /agent coder|chat|auto, /link, /clear, /migrate_chat\n"
         "Ключ: openrouter.ai -> Keys -> Create Key, затем /key add sk-or-...")
-HELP_ADMIN = "\n\nАдмин: /admin, /mc описание, /news ps99\n/post текст - всем сразу; /post 18:30 текст; /post 05.11 18:30 текст\n/posts, /delpost N\n/inv add имя pt0 2, /inv, /inv del имя - инвентарь PS99\n/admin backup - новая копия сейчас, /admin backups - список копий, /admin restore yes - восстановить, /admin bots - проверка ботов\n/setbackup ТОКЕН - привязать бота бэкапов\n/addsource all ссылка - общий источник (без all - только твой)"
+HELP_ADMIN = "\n\nАдмин: /admin, /mc описание, /news ps99\n/post текст - всем сразу; /post 18:30 текст; /post 05.11 18:30 текст\n/posts, /delpost N\n/acc add НикRoblox - привязать аккаунт PS99, /inv - живой инвентарь с RAP\n/price имя - цены всех вариантов, /new - что нового в игре\n/admin backup - новая копия сейчас, /admin backups - список копий, /admin restore yes - восстановить, /admin bots - проверка ботов\n/setbackup ТОКЕН - привязать бота бэкапов\n/addsource all ссылка - общий источник (без all - только твой)"
 ADMIN_SUBS = {"users", "ban", "unban", "viewkeys", "createcmd", "keypool", "status", "backup", "bots", "backups", "restore", "addkey", "logs", "broadcast", "health", "agents", "cachecl"}
 MENU = {"inline_keyboard": [[{"text": "Новости", "callback_data": "/news"}, {"text": "Рассылка вкл", "callback_data": "/sub on"}],
                              [{"text": "Источники", "callback_data": "/sources"}, {"text": "Справка", "callback_data": "/help"}]]}
@@ -385,14 +435,42 @@ async def admin(sub, arg):
             f"llm_calls={STAT['llm']} cache_hits={STAT['cache']} bot={STAT['bot']} err={STAT['err'][:80]}\n"
             "Команды: users, ban/unban ID, broadcast ТЕКСТ, logs [N], agents, cachecl, keypool, viewkeys, addkey, createcmd, health")
 
+def pick_photo(m):
+    if m.get("photo"):
+        ph = [p for p in m["photo"] if p.get("file_size", 0) <= 3_000_000] or m["photo"][:1]
+        return ph[-1]["file_id"]
+    d = m.get("document") or {}
+    if d.get("mime_type", "").startswith("image/") and d.get("file_size", 0) <= 5_000_000: return d["file_id"]
+
+async def mc_free(name):
+    if not (name.isascii() and re.fullmatch(r"\w{3,16}", name)): return "неверный формат (3-16 символов: буквы, цифры, _)"
+    try:
+        async with httpx.AsyncClient(timeout=15) as c: r = await c.get("https://api.minecraftservices.com/minecraft/profile/lookup/name/" + name)
+    except Exception: return "не удалось проверить"
+    return "занят" if r.status_code == 200 else "свободен (по данным Mojang)" if r.status_code == 404 else f"не знаю (код {r.status_code})"
+
+async def handle_photo(m, uid):
+    cap = (m.get("caption") or "").strip() or "Опиши, что на изображении, и ответь по делу."
+    await tg("sendChatAction", json={"chat_id": uid, "action": "typing"})
+    info = (await tg("getFile", json={"file_id": pick_photo(m)})).get("result") or {}
+    if not info.get("file_path"): return await say(uid, "[ERROR] не смог скачать фото (возможно, слишком большое)")
+    async with httpx.AsyncClient(timeout=60) as c: blob = (await c.get(f"{TGAPI}/file/bot{BOT}/{info['file_path']}")).content
+    mime = "image/png" if info["file_path"].lower().endswith(".png") else "image/jpeg"
+    sid = f"tg:{uid}"
+    out = await llm(hload(sid)[-6:] + [{"role": "user", "content": [{"type": "text", "text": cap},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64," + base64.b64encode(blob).decode()}}]}], "vision", uid)
+    if not out.startswith("[RATE LIMIT"): hadd(sid, "user", "[фото] " + cap); hadd(sid, "assistant", out)
+    await say(uid, out)
+
 async def handle(m):
     u = m["from"]; uid = u["id"]; txt = (m.get("text") or "").strip()
-    if not txt: return
+    if not txt and not pick_photo(m): return
     row = q("select banned from users where id=?", uid)
     if not row:
         q("insert into users values(?,?,0,?)", uid, u.get("first_name", ""), dt.datetime.now().isoformat())
         await say(ADMIN, f"[NEW USER] {uid} {u.get('first_name', '')}")
     elif row[0][0]: return
+    if not txt: return await handle_photo(m, uid)
     cmd, _, arg = txt.partition(" "); cmd = cmd.split("@")[0].lower(); arg = arg.strip(); sid = f"tg:{uid}"
     r = lambda s, **kw: say(uid, s, **kw)
     if cmd == "/start": return await r("[MY_AI // TERMINAL READY] Выбери модуль или просто пиши:", reply_markup=MENU)
@@ -449,19 +527,40 @@ async def handle(m):
         err = await job_backup(force=True)
         return await r(f"[OK] бот бэкапов @{me['result']['username']} привязан. " + (f"\n[BACKUP ERROR] {err}\nОткрой его, нажми /start, потом /admin backup" if err else "Тестовый бэкап отправлен.")
                        + "\nЧтобы это пережило перезапуск, добавь токен в Render как BACKUP_BOT_TOKEN.")
+    if cmd == "/nick":
+        names = re.findall(r"\S+", arg)[:15]
+        if not names: return await r("Пример: /nick Cana117 Sasha_Craft (до 15 ников за раз)")
+        res = await asyncio.gather(*[mc_free(n) for n in names])
+        return await r("\n".join(f"{n}: {t}" for n, t in zip(names, res)) + "\nСвободен не значит гарантия: имя может быть в резерве. Перед покупкой проверь на namemc.com.")
+    if uid == ADMIN and cmd == "/price":
+        if len(arg) < 3: return await r("Пример: /price huge ghostly dragon")
+        try: rp, ex = await rap_load(), await exists_load()
+        except Exception as e: return await r(f"[PS99 ERROR] {e!r}")
+        hits = sorted(((k, v) for k, v in rp.items() if arg.lower() in k.lower()), key=lambda x: -x[1])[:15]
+        return await r("\n".join(f"{k}: RAP {short(v)}" + (f", exist {ex[k]:,}" if k in ex else "") for k, v in hits) + "\n(RAP в API обновляется раз в 4 часа)" if hits else "ничего не нашёл")
+    if uid == ADMIN and cmd == "/acc":
+        sub, _, a = arg.partition(" ")
+        if sub == "add" and a:
+            q("insert or ignore into accs values(?)", a.strip()); t, _ = await inv_report(a.strip()); return await r("[OK] добавлен\n" + t)
+        if sub == "del" and a: q("delete from accs where nick=?", a.strip()); return await r("[OK] удалён")
+        return await r("\n".join(n for (n,) in q("select nick from accs")) or "аккаунтов нет. /acc add НикRoblox")
+    if uid == ADMIN and cmd == "/new":
+        await ps99_new(); return await r("[OK] проверил. Если что-то новое есть, пришлю отдельным сообщением")
     if uid == ADMIN and cmd == "/inv":
         sub, _, a = arg.partition(" ")
         if sub == "add" and a:
             mm = re.match(r"^(.+?)\s+(\d+)$", a); n, qty = (mm.group(1), int(mm.group(2))) if mm else (a, 1)
             q("insert into inv values(?,?) on conflict(name) do update set qty=qty+?", n.lower(), qty, qty); return await r(f"[OK] {n} x{qty}")
         if sub == "del" and a: q("delete from inv where name=?", a.lower()); return await r("[OK] удалено")
+        accs = [n for (n,) in q("select nick from accs")]
+        if accs and not sub: return await r("\n\n".join([(await inv_report(n))[0] for n in accs]))
         rows = q("select name,qty from inv")
         try: d = {k.lower(): v for k, v in (await rap_load()).items()}
         except Exception: d = {}
         tot, lines = 0, []
         for n, qn in rows:
             v = d.get(n, 0) * qn; tot += v; lines.append(f"{n} x{qn}: {v:,}" if v else f"{n} x{qn}: цена не найдена")
-        return await r("\n".join(lines) + f"\n\nИтого RAP: {tot:,}" if rows else "пусто. Пример: /inv add huge cat pt0 2")
+        return await r("\n".join(lines) + f"\n\nИтого RAP: {tot:,}" if rows else "пусто. Пример: /inv add huge cat golden 2")
     if cmd == "/mc":
         if uid != ADMIN: return await r("[ACCESS DENIED] только для админа")
         if not arg: return await r("Пример: /mc средневековая башня 9x9 из булыжника с крышей")
@@ -530,7 +629,7 @@ async def job_ping(_=None):
     if u:
         async with httpx.AsyncClient(timeout=20) as c: await c.get(u + "/api/health")
 async def job_streams(_=None):
-    await ps99_movers()
+    await ps99_movers(); await ps99_watch()
     async with httpx.AsyncClient(timeout=30) as c:
         for ch in [x for x in E("YT_CHANNELS", "").split(",") if x]:
             try:
