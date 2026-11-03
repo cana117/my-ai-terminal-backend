@@ -16,7 +16,7 @@ MSK, T0 = ZoneInfo("Europe/Moscow"), time.time()
 LOGS, LOGQ = collections.deque(maxlen=300), collections.deque(maxlen=1000)
 class _H(logging.Handler):
     def emit(self, r):
-        line = f"{dt.datetime.now():%d.%m %H:%M:%S} {r.levelname} {r.getMessage()}"; LOGS.append(line); LOGQ.append(line)
+        line = f"{dt.datetime.now(MSK):%d.%m %H:%M:%S} {r.levelname} {r.getMessage()}"; LOGS.append(line); LOGQ.append(line)
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)  # иначе токен бота попадает в логи
 log = logging.getLogger("myai"); log.addHandler(_H())
@@ -53,7 +53,8 @@ cool, cache, hist_pref, pending, ipc = {}, collections.OrderedDict(), {}, {}, {}
 FREE = []
 
 SYS = {
- "chat": "Ты MY_AI, кибер-терминальный ассистент. Стиль: тёмный хакерский терминал, коротко и по делу, без скрытых действий. "
+ "chat": "Ты MY_AI, ассистент в Telegram и на сайте. Стиль: лаконичный терминальный, можно метки в квадратных скобках. "
+         "Отвечай на языке пользователя, коротко и по делу. Не предлагай взлом, обход защиты и подобное. "
          "Если приходится остановиться из-за лимита, выдай отчёт: [COMPLETED], [FILE GENERATED], [LIMIT REACHED PREEMPTIVELY], [NEXT STEPS].",
  "coder": "Ты Агент-Кодер: пишешь и дорабатываешь код, отвечаешь кратко, код в блоках. Без воды.",
  "optimizer": "Ты Агент-Оптимизатор: сжимаешь текст без потери фактов, максимально коротко.",
@@ -219,7 +220,7 @@ async def digest():
     t = re.findall(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", xml)[1:9]
     return await llm([{"role": "user", "content": "Сделай короткую сводку:\n" + "\n".join(t)}], "optimizer")
 
-VERSION = "1.6"
+VERSION = "1.6.1"
 CHANGELOG = ["1.6: до 5 копий базы в двух местах, автовыбор свежей и запасной, логи сохраняются",
              "1.5: отдельный бот для бэкапов (/setbackup, /admin bots)",
              "1.4: база сама восстанавливается после перезапуска",
@@ -491,6 +492,7 @@ async def handle(m):
         return await r(await admin(sub.lower(), a.strip()))
     c = q("select text from cmds where name=?", cmd.lstrip("/"))
     if c: return await r(c[0][0])
+    if cmd.startswith("/"): return await r("Не знаю такой команды. /help")
     await r(await reply(sid, uid, txt, hist_pref.get(uid)))
 
 def hist_load_tail(sid): return hload(sid)[-10:]
