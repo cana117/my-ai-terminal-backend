@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 E = os.environ.get
 BOT, ADMIN = E("BOT_TOKEN"), int(E("ADMIN_ID", "0") or 0)
+TESTER = int(E("TESTER_ID", "0") or 0)  # второй аккаунт админа (необязательно, только очередь рассылки; роль тестера будет в пункте 4)
 TGAPI = E("TG_API", "https://api.telegram.org").rstrip("/")
 ADMIN_TOKEN, PKEY = E("ADMIN_TOKEN", ""), E("POLLINATIONS_KEY", "")
 DB, DATAVER = E("DB_PATH", "/tmp/data.db"), int(E("MC_DATA_VERSION", "4671"))
@@ -25,7 +26,7 @@ create table if not exists cmds(name text primary key,text text);
 create table if not exists hist(id integer primary key autoincrement,sid text,role text,content text);
 create table if not exists links(cid text primary key,uid int);
 create table if not exists sources(id integer primary key autoincrement,owner int,kind text,url text,title text,unique(owner,url));
-create table if not exists subs(uid integer primary key,active int default 0,times text default '09:00,21:00',fmt text default 'ai');
+create table if not exists subs(uid integer primary key,active int default 0,times text default '12:00',fmt text default 'ai');
 create table if not exists posts(id integer primary key autoincrement,at text,text text,sent int default 0);
 create table if not exists seen(uid int,key text,primary key(uid,key));
 create table if not exists inv(name text primary key,qty int);
@@ -49,6 +50,7 @@ def q(sql, *a):
 def getv(k): r = db.execute("select v from settings where k=?", (k,)).fetchone(); return r[0] if r else None
 def setv(k, v): db.execute("insert or replace into settings values(?,?)", (k, str(v))); db.commit()
 # --- журнал действий пользователей для /admin logs. Пишем только название команды, без текста и аргументов (там могут быть ключи) ---
+def panic(): return getv("panic") == "1"
 def act(uid, what):
     try: q("insert into ulogs(uid,at,what) values(?,?,?)", uid, dt.datetime.now(MSK).strftime("%d.%m %H:%M"), what[:60]); q("delete from ulogs where id<=(select max(id) from ulogs)-3000")
     except Exception as e: log.error("act: %r", e)
@@ -293,9 +295,9 @@ async def norm_source(s):
     if not s.startswith("http"): raise ValueError("нужна ссылка на RSS, @канал или YouTube")
     return k, s
 srccache = {}
-async def fetch_items(kind, url):
+async def fetch_items(kind, url, fresh=False):
     ck = (kind, url)
-    if ck in srccache and srccache[ck][0] > time.time(): return srccache[ck][1]
+    if not fresh and ck in srccache and srccache[ck][0] > time.time(): return srccache[ck][1]
     items = []
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}) as c:
@@ -303,31 +305,98 @@ async def fetch_items(kind, url):
             elif kind == "yt": items = parse_rss((await c.get("https://www.youtube.com/feeds/videos.xml?channel_id=" + url)).text)
             else: items = parse_rss((await c.get(url)).text)
     except Exception as e: log.error("source %s: %r", url[:40], e)
-    srccache[ck] = (time.time() + 300, items); return items
+    if not items and ck in srccache and srccache[ck][1]:  # источник временно молчит: оставляем прошлое, пробуем снова через 2 минуты
+        srccache[ck] = (time.time() + 120, srccache[ck][1]); return srccache[ck][1]
+    srccache[ck] = (time.time() + 900, items); return items
 async def collect(uid, only_new):
     out = []
-    for kind, url, title in q("select kind,url,title from sources where owner in (0,?)", uid):
+    for kind, url, title in q("select kind,url,title from sources where owner in (0,?) order by id", uid):
         for key, t, l in (await fetch_items(kind, url))[:5]:
             if only_new and q("select 1 from seen where uid=? and key=?", uid, key): continue
             out.append((title or url, key, t, l))
     return out
-def get_sub(uid): return (q("select active,times,fmt from subs where uid=?", uid) or [(0, "09:00,21:00", "ai")])[0]
-async def fmt_digest(uid, items, fmt):
-    items = items[:15]; head = ""
-    if fmt == "ai":
-        head = await llm([{"role": "user", "content": "Коротко, 2-3 предложения: о чём эти новости:\n" + "\n".join(i[2] for i in items)}], "optimizer", uid)
-        head = "" if head.startswith("[RATE LIMIT") else head + "\n\n"
-    return head + "\n\n".join(f"• [{s}] {t}\n{l}" for s, _, t, l in items)
-async def job_digests(hhmm):
-    for uid, times, fmt in q("select uid,times,fmt from subs where active=1"):
-        if hhmm not in times.split(","): continue
-        try:
-            items = await collect(uid, True)
-            if items:
-                await say(uid, "[NEWS]\n" + await fmt_digest(uid, items, fmt), disable_web_page_preview=True)
-                for _, k, _, _ in items: q("insert or ignore into seen values(?,?)", uid, k)
-        except Exception as e: log.error("digest %s: %r", uid, e)
-        await asyncio.sleep(0.1)
+def sub_default(uid): return (1, "10:00,21:00") if uid == ADMIN else (0, "12:00")
+def ensure_sub(uid):
+    a, t = sub_default(uid); q("insert or ignore into subs(uid,active,times) values(?,?,?)", uid, a, t)
+def get_sub(uid):
+    r = q("select active,times,fmt from subs where uid=?", uid)
+    return r[0] if r else (*sub_default(uid), "ai")
+headcache, warmed = {}, set()
+DGF, DG_LATE, DG_WARM = "%Y-%m-%d %H:%M", dt.timedelta(hours=6), dt.timedelta(minutes=20)
+def _w(t): return set(re.findall(r"\w{3,}", t.lower()))
+def merge_dups(items):
+    """Склейка одинаковых новостей из разных источников БЕЗ ИИ (токены не тратятся): похожие заголовки -> один пункт со всеми ссылками."""
+    gs = []
+    for src, key, t, l in items:
+        w = _w(t)
+        for g in gs:
+            if w and g["w"] and len(w & g["w"]) / len(w | g["w"]) >= 0.6:
+                g["k"].append(key)
+                if all(x[1] != l for x in g["src"]): g["src"].append((src, l))
+                break
+        else: gs.append({"t": t, "w": w, "src": [(src, l)], "k": [key]})
+    return gs
+async def get_head(texts):
+    """Краткий ИИ-пересказ. Кэш по набору новостей: одинаковый набор у разных людей = один запрос к ИИ. Всегда общий пул (uid=0), не личные ключи."""
+    ck = hashlib.md5("|".join(sorted(texts)).encode()).hexdigest()
+    if ck in headcache and headcache[ck][0] > time.time(): STAT["cache"] += 1; return headcache[ck][1]
+    h = await llm([{"role": "user", "content": "Коротко, 2-3 предложения: о чём эти новости:\n" + "\n".join(texts)}], "optimizer", 0)
+    if h.startswith("[RATE LIMIT"): return ""
+    headcache[ck] = (time.time() + 6 * 3600, h + "\n\n")
+    if len(headcache) > 200: headcache.pop(next(iter(headcache)))
+    return h + "\n\n"
+async def make_digest(items, fmt):
+    gs = merge_dups(items)[:15]; body = []
+    for g in gs:
+        t = g["t"][:140]
+        body.append(f"• [{g['src'][0][0]}] {t}\n{g['src'][0][1]}" if len(g["src"]) == 1 else f"• {t}\n" + "\n".join(f"  [{a}] {b}" for a, b in g["src"]))
+    head = await get_head([g["t"] for g in gs]) if fmt == "ai" else ""
+    return head + "\n\n".join(body), [k for g in gs for k in g["k"]]
+async def fmt_digest(uid, items, fmt): return (await make_digest(items, fmt))[0]
+def mark_sent(uid, slot=None): setv(f"dg:{uid}", slot or dt.datetime.now(MSK).strftime(DGF))
+async def send_digest(uid, fmt, slot):
+    mark_sent(uid, slot)  # сначала отметка: при сбое не будет дубля
+    try:
+        items = await collect(uid, True)
+        if not items: return
+        text, keys = await make_digest(items, fmt)
+        await say(uid, "[NEWS]\n" + text, disable_web_page_preview=True)
+        for k in keys: q("insert or ignore into seen values(?,?)", uid, k)
+    except Exception as e: log.error("digest %s: %r", uid, e)
+dg_lock = asyncio.Lock()
+async def job_digests(_=None):
+    if panic() or dg_lock.locked(): return
+    async with dg_lock:
+        now = dt.datetime.now(MSK); due, warm = [], []
+        for uid, times, fmt in q("select uid,times,fmt from subs where active=1"):
+            last = getv(f"dg:{uid}") or ""; ok = []
+            for t in times.split(","):
+                try: h, mi = map(int, t.split(":")); sl = now.replace(hour=h, minute=mi, second=0, microsecond=0)
+                except ValueError: continue
+                if sl <= now and now - sl <= DG_LATE and sl.strftime(DGF) > last: ok.append(sl.strftime(DGF))  # догонялка: слот был, а выпуска нет
+                elif now < sl <= now + DG_WARM: warm.append((uid, fmt, sl.strftime(DGF)))
+            if ok: due.append((uid, fmt, max(ok)))
+        due.sort(key=lambda x: (x[0] != ADMIN, x[0] != TESTER))  # сначала админ, потом тестер (второй аккаунт), потом остальные
+        for uid, fmt, sl in warm:  # заготовка заранее: источники и пересказ попадают в кэш
+            if (uid, sl) in warmed: continue
+            warmed.add((uid, sl))
+            try:
+                its = await collect(uid, True)
+                if its: await make_digest(its, fmt)
+            except Exception as e: log.error("warm %s: %r", uid, e)
+        if len(warmed) > 500: warmed.clear()
+        for uid, fmt, sl in [d for d in due if d[0] in (ADMIN, TESTER)]: await send_digest(uid, fmt, sl)
+        rest = [d for d in due if d[0] not in (ADMIN, TESTER)]
+        for i in range(0, len(rest), 8):  # пачками по 8, пауза 1 с (лимиты Telegram)
+            await asyncio.gather(*[send_digest(*d) for d in rest[i:i + 8]]); await asyncio.sleep(1)
+async def job_sources(_=None):
+    """Раз в 15 минут обновляет все источники (Telegram-каналы, RSS-новости, YouTube) одним проходом: у каждого источника один запрос на всех."""
+    rows = q("select distinct kind,url from sources"); sem = asyncio.Semaphore(5)
+    async def one(k, u):
+        async with sem: await fetch_items(k, u, True)
+    await asyncio.gather(*[one(k, u) for k, u in rows], return_exceptions=True)
+    for ck in [k for k, v in srccache.items() if v[0] < time.time() - 3600]: srccache.pop(ck, None)
+    log.info("sources refreshed: %d", len(rows))
 
 # ---------- Объявления от админа всем ----------
 def parse_when(arg):
@@ -342,6 +411,7 @@ def parse_when(arg):
         return (w + dt.timedelta(days=1) if w <= n else w), t
     return n, arg
 async def job_posts(_=None):
+    if panic(): return
     now = dt.datetime.now(MSK).strftime("%Y-%m-%d %H:%M")
     for pid, text in q("select id,text from posts where sent=0 and at<=?", now):
         q("update posts set sent=1 where id=?", pid); n = 0
@@ -366,8 +436,9 @@ HELP_ADMIN = ("\n\nАдмин: /admin, /mc описание, /news ps99\n/post �
               "/admin get_db - прислать базу файлом (.db); /admin get_config - прислать настройки (config.json). "
               "Изменённый config.json просто отправь боту документом; .db - с подписью /admin set_db yes\n"
               "/admin backup - бэкап в бота-сейвера сейчас, /admin backups - список копий и режим, /admin restore yes - восстановить, /admin bots - проверка ботов\n"
+              "/panic - тревожная кнопка (on, keys, off): бот молчит для всех кроме тебя, рассылки стоят, бэкап сразу в бота-сейвера\n"
               "/setbackup ТОКЕН - привязать бота-сейвера\n/addsource all ссылка - общий источник (без all - только твой)")
-ADMIN_SUBS = {"users", "ban", "unban", "viewkeys", "createcmd", "keypool", "status", "backup", "bots", "backups", "restore", "addkey", "logs", "broadcast", "health", "agents", "cachecl", "get_db", "get_config"}
+ADMIN_SUBS = {"users", "ban", "unban", "viewkeys", "createcmd", "keypool", "status", "backup", "bots", "backups", "restore", "addkey", "logs", "broadcast", "health", "agents", "cachecl", "get_db", "get_config", "pushupdates"}
 MENU = {"inline_keyboard": [[{"text": "Новости", "callback_data": "/news"}, {"text": "Рассылка вкл", "callback_data": "/sub on"}],
                             [{"text": "Источники", "callback_data": "/sources"}, {"text": "Справка", "callback_data": "/help"}]]}
 def mask(k): return k[:8] + "..." + k[-4:]
@@ -493,6 +564,14 @@ async def admin(sub, arg):
                 + ("НЕ ПРИВЯЗАН, автобэкапы выключены. /setbackup ТОКЕН" if not t else await chk(t) + f" (чат {c})") + "\nБаза: " + ("есть изменения" if dirty else "бэкап свежий"))
     if sub == "cachecl": cache.clear(); return "[OK] кэш очищен"
     if sub == "agents": return "\n".join(f"{r}: {', '.join(models_for(r)) or 'нет free-моделей -> Pollinations'}" for r in ("coder", "optimizer", "chat"))
+    if sub in ("pushupdates", "broadcast") and panic(): return "[ТРЕВОГА] рассылки остановлены. /panic off - выключить режим"
+    if sub == "pushupdates":
+        n = 0
+        for (i,) in q("select id from users where banned=0"):
+            try: await say(i, f"[UPDATE] v{VERSION}\n" + CHANGELOG[0]); n += 1
+            except Exception: pass
+            await asyncio.sleep(0.05)
+        return f"[UPDATE] разослано {n}"
     if sub == "broadcast" and arg:
         n = 0
         for (i,) in q("select id from users where banned=0"):
@@ -502,8 +581,8 @@ async def admin(sub, arg):
         return f"[BROADCAST] доставлено {n}"
     up = int(time.time() - T0)
     return (f"[STATUS] v{VERSION} up={up // 3600}ч{up % 3600 // 60}м users={len(q('select id from users'))} keys={len(keys_for(0))} free_models={len(FREE)} "
-            f"llm_calls={STAT['llm']} cache_hits={STAT['cache']} bot={STAT['bot']} err={STAT['err'][:80]}\n"
-            "Команды: users, ban/unban ID, broadcast ТЕКСТ, logs [N|sys], get_db, get_config, backup, backups, bots, restore, agents, cachecl, keypool, viewkeys, addkey, createcmd, health")
+            f"llm_calls={STAT['llm']} cache_hits={STAT['cache']} bot={STAT['bot']} {'ТРЕВОГА=ВКЛ ' if panic() else ''}err={STAT['err'][:80]}\n"
+            "Команды: users, ban/unban ID, broadcast ТЕКСТ, pushupdates (разослать /updates всем), logs [N|sys], get_db, get_config, backup, backups, bots, restore, agents, cachecl, keypool, viewkeys, addkey, createcmd, health")
 
 def pick_photo(m):
     if m.get("photo"):
@@ -532,6 +611,7 @@ async def handle_photo(m, uid):
 async def handle(m):
     u = m["from"]; uid = u["id"]; txt = (m.get("text") or "").strip()
     if not txt and not pick_photo(m) and not (uid == ADMIN and m.get("document")): return
+    if uid != ADMIN and panic(): return  # ТРЕВОГА: отвечаю только админу
     row = q("select banned from users where id=?", uid)
     if not row:
         q("insert into users values(?,?,0,?)", uid, u.get("first_name", ""), dt.datetime.now().isoformat())
@@ -543,7 +623,9 @@ async def handle(m):
         return await handle_photo(m, uid)
     cmd, _, arg = txt.partition(" "); cmd = cmd.split("@")[0].lower(); arg = arg.strip(); sid = f"tg:{uid}"
     r = lambda s, **kw: say(uid, s, **kw)
-    if cmd == "/start": return await r("Привет! Выбери действие или просто напиши вопрос:", reply_markup=MENU)
+    if cmd == "/start":
+        mk = {"inline_keyboard": MENU["inline_keyboard"] + ([[{"text": "🚨 Тревога", "callback_data": "/panic"}]] if uid == ADMIN else [])}
+        return await r("Привет! Выбери действие или просто напиши вопрос:", reply_markup=mk)
     if cmd == "/help": return await r(HELP + (HELP_ADMIN if uid == ADMIN else ""))
     if cmd == "/clear": q("delete from hist where sid=?", sid); return await r("[OK] чат очищен")
     if cmd == "/news":
@@ -567,17 +649,35 @@ async def handle(m):
     if cmd == "/delsource" and arg.isdigit():
         q("delete from sources where id=? and (owner=? or ?)", int(arg), uid, uid == ADMIN); return await r("[OK] удалено, если это был твой источник")
     if cmd in ("/sub", "/time", "/format"):
-        q("insert or ignore into subs(uid) values(?)", uid)
-        if cmd == "/sub" and arg in ("on", "off"): q("update subs set active=? where uid=?", int(arg == "on"), uid)
+        ensure_sub(uid)
+        if cmd == "/sub" and arg in ("on", "off"):
+            q("update subs set active=? where uid=?", int(arg == "on"), uid)
+            if arg == "on": mark_sent(uid)  # чтобы сразу после включения не прилетел «догоняющий» выпуск
         if cmd == "/format" and arg in ("ai", "short"): q("update subs set fmt=? where uid=?", arg, uid)
         if cmd == "/time":
             ts = [x for x in arg.split() if re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", x)][:4]
             if not ts: return await r("Пример: /time 09:00 21:00")
-            q("update subs set times=? where uid=?", ",".join(ts), uid)
+            q("update subs set times=? where uid=?", ",".join(ts), uid); mark_sent(uid)
         a, t, f = get_sub(uid); return await r(f"[РАССЫЛКА] {'ВКЛ' if a else 'ВЫКЛ'}, время: {t} (МСК), формат: {f}. Приходит только новое.")
     if cmd == "/updates":
         a, t, f = get_sub(uid); return await r(f"Версия v{VERSION} (Alpha)\n" + "\n".join(CHANGELOG) + f"\n\nТвоя рассылка: {'ВКЛ' if a else 'ВЫКЛ'}, {t} МСК")
+    if uid == ADMIN and cmd == "/panic":
+        if arg in ("on", "keys"):
+            setv("panic", 1); log.warning("PANIC ON (%s)", arg)
+            err = await job_backup(force=True)  # сначала свежая копия в бота-сейвера (только твой чат)
+            n = 0
+            if arg == "keys": n = len(q("select 1 from keys")); q("delete from keys")
+            return await r("[🚨 ТРЕВОГА ВКЛ]\n- бот молчит для всех, кроме тебя (чат, подписки, посты, веб, новые пользователи)\n- бэкап: " + (f"ОШИБКА {err}" if err else "отправлен в бота-сейвера")
+                           + (f"\n- ключей в базе удалено: {n} (копия есть в бэкапе)\n- ключи в Render (OPENROUTER_KEYS и др.) бот удалить не может: перевыпусти их на сайтах провайдеров и замени в Environment" if arg == "keys" else "")
+                           + "\nВыключить: /panic off")
+        if arg == "off": setv("panic", 0); log.warning("PANIC OFF"); return await r("[ТРЕВОГА ВЫКЛ] бот снова работает для всех")
+        if arg == "cancel": return await r("Отменено.")
+        if panic(): return await r("🚨 Режим тревоги ВКЛЮЧЁН.", reply_markup={"inline_keyboard": [[{"text": "Выключить", "callback_data": "/panic off"}]]})
+        return await r("🚨 Тревожная кнопка. Что сделать?\n\nВключить: бот замолкает для всех, кроме тебя, рассылки стоят, бэкап уходит в бота-сейвера. "
+                       "Второй вариант ещё и стирает ключи из базы.", reply_markup={"inline_keyboard": [[{"text": "🚨 Включить", "callback_data": "/panic on"}],
+                       [{"text": "🚨 + стереть ключи из базы", "callback_data": "/panic keys"}], [{"text": "Отмена", "callback_data": "/panic cancel"}]]})
     if uid == ADMIN and cmd == "/post":
+        if panic(): return await r("[ТРЕВОГА] рассылки остановлены. /panic off - выключить режим")
         if not arg: return await r("Всем сразу: /post текст\nНа время: /post 18:30 текст\nНа дату: /post 05.11 18:30 текст")
         try: w, t = parse_when(arg)
         except ValueError: return await r("[ERROR] неверная дата")
@@ -599,7 +699,7 @@ async def handle(m):
                        + "\nЧтобы это пережило перезапуск, добавь токен в Render как BACKUP_BOT_TOKEN.")
     if cmd == "/nick":
         names = re.findall(r"\S+", arg)[:15]
-        if not names: return await r("Пример: /nick Cana117 Sasha_Craft (до 15 ников за раз)")
+        if not names: return await r("Пример: /nick Steve_Builder Alex_Craft (до 15 ников за раз)")
         res = await asyncio.gather(*[mc_free(n) for n in names])
         return await r("\n".join(f"{n}: {t}" for n, t in zip(names, res)) + "\nСвободен не значит гарантия: имя может быть в резерве. Перед покупкой проверь на namemc.com.")
     if uid == ADMIN and cmd == "/price":
@@ -691,12 +791,13 @@ async def poll():
 
 # ---------- Scheduler ----------
 last_yt, live_tw = {}, set()
-async def job_news(_=None): await say(ADMIN, await ps99())
 async def job_mod(_=None): await refresh_models()
 async def job_ping(_=None):
     u = E("RENDER_EXTERNAL_URL")
     if u:
-        async with httpx.AsyncClient(timeout=20) as c: await c.get(u + "/api/health")
+        try:
+            async with httpx.AsyncClient(timeout=20) as c: await c.get(u + "/api/ping")
+        except Exception as e: log.error("ping: %r", e)
 async def job_streams(_=None):
     await ps99_movers(); await ps99_watch()
     async with httpx.AsyncClient(timeout=30) as c:
@@ -811,14 +912,14 @@ async def restore(force=False):
             log.info("restore: восстановлено из %s", label); return f"восстановлено из копии ({label})"
         except Exception as e: log.error("restore %s: %r", label, e)
     return "ни одна копия не открылась"
-JOBS = {"dg": job_digests, "news": job_news, "yt": job_streams, "bk": job_backup, "mod": job_mod, "ping": job_ping}
+JOBS = {"dg": job_digests, "src": job_sources, "yt": job_streams, "bk": job_backup, "mod": job_mod, "ping": job_ping}
 async def sched():
     done = set()
     while True:
         n = dt.datetime.now(MSK)
-        for tag, ok in (("dg-" + n.strftime("%F-%H:%M"), True), ("news-" + n.strftime("%F-%H"), n.hour in (10, 21)), ("yt-" + n.strftime("%F-%H"), True),
+        for tag, ok in (("dg-" + n.strftime("%F-%H:%M"), True), ("src-" + n.strftime("%F-%H-") + str(n.minute // 15), True), ("yt-" + n.strftime("%F-%H"), True),
                         ("bk-" + n.strftime("%F-%H-") + str(n.minute // 30), True),  # проверка раз в 30 мин: пора ли делать бэкап (решает job_backup по интервалу)
-                        ("mod-" + n.strftime("%F-") + str(n.hour // 6), True), ("ping-" + n.strftime("%F-%H-") + str(n.minute // 10), True)):
+                        ("mod-" + n.strftime("%F-") + str(n.hour // 6), True), ("ping-" + n.strftime("%F-%H-") + str(n.minute // 5), True)):
             if ok and tag not in done:
                 done.add(tag); asyncio.create_task(JOBS[tag.split("-")[0]](n.strftime("%H:%M")))
         flush_logs(); asyncio.create_task(job_posts())
@@ -833,9 +934,14 @@ async def start():
     rs = await restore(); log.info("start v%s: %s", VERSION, rs)
     if not q("select 1 from sources limit 1"):
         q("insert into sources(owner,kind,url,title) values(0,'rss',?,'Лента.ру')", E("NEWS_RSS", "https://lenta.ru/rss/news"))
+    if ADMIN:
+        ensure_sub(ADMIN); q("update subs set times='10:00,21:00' where uid=? and times='09:00,21:00'", ADMIN)
+    q("update subs set times='12:00' where uid!=? and times='09:00,21:00'", ADMIN)
     asyncio.create_task(refresh_models()); asyncio.create_task(sched())
     if BOT:
         asyncio.create_task(poll()); asyncio.create_task(say(ADMIN, f"[DEPLOY] v{VERSION}: сервис перезапущен. База: {rs}."))
+@app.get("/api/ping")
+def ping(): return {"ok": True}
 @app.get("/api/health")
 def health(): return {"bot": STAT["bot"], "err": STAT["err"], "keys": len(keys_for(0)), "free_models": len(FREE), "pollinations": bool(PKEY), "admin_set": bool(ADMIN)}
 @app.get("/")
@@ -845,6 +951,7 @@ def web_sid(cid, chat):
     return (f"tg:{r[0][0]}", r[0][0]) if r else (f"web:{cid}:{chat}", 0)
 @app.post("/api/chat")
 async def chat(req: Request):
+    if panic(): return JSONResponse({"reply": "[MAINTENANCE] сервис временно недоступен"}, 503)
     ip, now = req.headers.get("x-forwarded-for", req.client.host).split(",")[0], time.time()
     ipc[ip] = [t for t in ipc.get(ip, []) if t > now - 60]
     if len(ipc[ip]) >= 20: return JSONResponse({"reply": "[RATE LIMIT REACHED]: Лимит исчерпан. Восстановление через 1 минут."}, 429)
@@ -856,6 +963,7 @@ async def chat(req: Request):
     return {"reply": await reply(sid, uid, text, hist_pref.get(uid))}
 @app.post("/api/link")
 async def link(req: Request):
+    if panic(): return JSONResponse({"reply": "[MAINTENANCE] сервис временно недоступен"}, 503)
     b = await req.json(); p = pending.get(str(b.get("code", "")))
     if not p or p[1] < time.time(): return JSONResponse({"reply": "[LINK ERROR] код неверен или истёк"}, 400)
     q("insert or replace into links values(?,?)", str(b.get("cid", ""))[:40], p[0]); pending.pop(str(b["code"]), None)
