@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MY_AI // TERMINAL</title>
+<style>
+:root{--bg:#07090b;--fg:#b7f5c4;--dim:#4f6b57;--acc:#3dff8a;--me:#7fd4ff;--err:#ff6b6b;--line:#16231a}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:14px/1.55 ui-monospace,Menlo,Consolas,monospace;display:flex}
+aside{width:230px;border-right:1px solid var(--line);padding:12px;overflow:auto;flex:none}
+aside button{display:block;width:100%;text-align:left;background:none;border:0;color:var(--dim);font:inherit;padding:5px 6px;cursor:pointer}
+aside button.on,aside button:hover{color:var(--acc)}
+main{flex:1;display:flex;flex-direction:column;min-width:0}
+header{padding:10px 16px;border-bottom:1px solid var(--line);color:var(--acc);display:flex;gap:12px;align-items:center}
+header span{color:var(--dim);flex:1}
+#log{flex:1;overflow:auto;padding:16px;white-space:pre-wrap;word-break:break-word}
+.u{color:var(--me)}.a{color:var(--fg)}.s{color:var(--dim)}
+.u::before{content:"> "}.a::before{content:"MY_AI: ";color:var(--acc)}
+#log div{margin-bottom:12px;max-width:90ch}
+form{display:flex;border-top:1px solid var(--line)}
+form b{color:var(--acc);padding:12px 0 12px 16px}
+input{flex:1;background:none;border:0;color:var(--fg);font:inherit;padding:12px 8px;outline:0}
+button:focus-visible,input:focus-visible{outline:1px solid var(--acc)}
+#tg{display:none;background:none;border:1px solid var(--line);color:var(--acc);font:inherit;cursor:pointer}
+@media(max-width:700px){aside{display:none;position:absolute;inset:44px 0 0 0;width:auto;background:var(--bg);z-index:2}aside.open{display:block}#tg{display:block}}
+@media(prefers-reduced-motion:no-preference){.cur{animation:b 1s steps(2) infinite}@keyframes b{50%{opacity:0}}}
+</style></head><body>
+<aside id="side"><button onclick="neu()">+ новый чат</button><div id="list"></div><button onclick="clr()">/clear</button></aside>
+<main>
+<header><button id="tg" onclick="side.classList.toggle('open')">чаты</button>MY_AI // TERMINAL READY<span id="hol"></span></header>
+<div id="log" aria-live="polite"></div>
+<form onsubmit="send(event)"><b>&gt;</b><input id="inp" autocomplete="off" autofocus aria-label="Сообщение"></form>
+</main>
+<script>
+const $=s=>document.querySelector(s);
+const H={"01-01":"С Новым годом","02-23":"С Днём защитника Отечества","03-08":"С 8 марта","05-01":"С Праздником Весны и Труда","05-09":"С Днём Победы","06-12":"С Днём России","11-04":"С Днём народного единства","12-31":"С наступающим Новым годом"};
+const API='';/* если сайт на HF, а бэкенд на Render: https://xxx.onrender.com */
+let CID=localStorage.getItem('cid');if(!CID){CID=Math.random().toString(36).slice(2,12);try{localStorage.setItem('cid',CID)}catch(e){}}
+let S={},cur;
+try{S=JSON.parse(localStorage.getItem('chats')||'{}')}catch(e){}
+const save=()=>{try{localStorage.setItem('chats',JSON.stringify(S))}catch(e){}};
+const d=new Date(),k=String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+if(H[k])$('#hol').textContent=H[k]+'!';
+function neu(){cur=Date.now()+'';S[cur]={t:'новый чат',m:[]};save();draw();side.classList.remove('open')}
+function clr(){S[cur].m=[];S[cur].t='новый чат';save();draw()}
+function draw(){
+  const l=$('#list');l.textContent='';
+  Object.keys(S).reverse().forEach(id=>{const b=document.createElement('button');b.textContent=S[id].t;b.className=id==cur?'on':'';b.onclick=()=>{cur=id;draw();side.classList.remove('open')};l.append(b)});
+  const g=$('#log');g.textContent='';
+  if(!S[cur].m.length)add('s','нейронный кластер на связи. вводи текст.');
+  S[cur].m.forEach(m=>add(m.role=='user'?'u':'a',m.content));
+  g.scrollTop=g.scrollHeight;
+}
+function add(c,t){const e=document.createElement('div');e.className=c;e.textContent=t;$('#log').append(e);return e}
+async function send(ev){
+  ev.preventDefault();const v=inp.value.trim();if(!v)return;inp.value='';
+  const c=S[cur];c.m.push({role:'user',content:v});if(c.m.length==1)c.t=v.slice(0,24);draw();
+  add('s','обработка…');
+  try{
+    const r=await fetch(API+(v.startsWith('/link ')?'/api/link':'/api/chat'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cid:CID,chat:cur,text:v,code:v.slice(6).trim()})});
+    c.m.push({role:'assistant',content:(await r.json()).reply});
+  }catch(e){c.m.push({role:'assistant',content:'[CONN ERROR]: бэкенд недоступен'})}
+  save();draw();
+}
+if(!Object.keys(S).length)neu();else{cur=Object.keys(S).pop();draw()}
+</script></body></html>
