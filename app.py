@@ -4,7 +4,6 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
-
 E = os.environ.get
 BOT, ADMIN = E("BOT_TOKEN"), int(E("ADMIN_ID", "0") or 0)
 TGAPI = E("TG_API", "https://api.telegram.org").rstrip("/")
@@ -12,7 +11,6 @@ ADMIN_TOKEN, PKEY = E("ADMIN_TOKEN", ""), E("POLLINATIONS_KEY", "")
 DB, DATAVER = E("DB_PATH", "/tmp/data.db"), int(E("MC_DATA_VERSION", "4671"))
 OR, POLLI = "https://openrouter.ai/api/v1", "https://gen.pollinations.ai/v1/chat/completions"
 MSK, T0 = ZoneInfo("Europe/Moscow"), time.time()
-
 LOGS, LOGQ = collections.deque(maxlen=300), collections.deque(maxlen=1000)
 class _H(logging.Handler):
     def emit(self, r):
@@ -20,7 +18,6 @@ class _H(logging.Handler):
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)  # иначе токен бота попадает в логи
 log = logging.getLogger("myai"); log.addHandler(_H())
-
 db = sqlite3.connect(DB, check_same_thread=False)
 SCHEMA = """create table if not exists users(id integer primary key,name text,banned int default 0,joined text);
 create table if not exists keys(owner int,key text unique);
@@ -34,32 +31,37 @@ create table if not exists seen(uid int,key text,primary key(uid,key));
 create table if not exists inv(name text primary key,qty int);
 create table if not exists settings(k text primary key,v text);
 create table if not exists accs(nick text primary key);
-create table if not exists logs(id integer primary key autoincrement,line text);"""
+create table if not exists logs(id integer primary key autoincrement,line text);
+create table if not exists ulogs(id integer primary key autoincrement,uid int,at text,what text);"""
 db.executescript(SCHEMA)
 def flush_logs():
     try:
         while LOGQ: db.execute("insert into logs(line) values(?)", (LOGQ.popleft(),))
         db.execute("delete from logs where id not in (select id from logs order by id desc limit 1000)"); db.commit()
     except Exception: pass
-
 dirty = False
 def q(sql, *a):
     global dirty
     c = db.execute(sql, a); db.commit()
     if not sql.lstrip().lower().startswith("select") and "hist" not in sql and "logs" not in sql: dirty = True
     return c.fetchall()
-
-STAT = {"cache": 0, "llm": 0, "bot": "not started", "err": ""}
+# --- служебные настройки (таблица settings). setv НЕ помечает базу "изменённой", чтобы служебные записи не вызывали бэкап ---
+def getv(k): r = db.execute("select v from settings where k=?", (k,)).fetchone(); return r[0] if r else None
+def setv(k, v): db.execute("insert or replace into settings values(?,?)", (k, str(v))); db.commit()
+# --- журнал действий пользователей для /admin logs. Пишем только название команды, без текста и аргументов (там могут быть ключи) ---
+def act(uid, what):
+    try: q("insert into ulogs(uid,at,what) values(?,?,?)", uid, dt.datetime.now(MSK).strftime("%d.%m %H:%M"), what[:60]); q("delete from ulogs where id<=(select max(id) from ulogs)-3000")
+    except Exception as e: log.error("act: %r", e)
+STAT = {"cache": 0, "llm": 0, "bot": "not started", "err": "", "cut": 0}
 cool, cache, hist_pref, pending, ipc = {}, collections.OrderedDict(), {}, {}, {}
 FREE, VISION = [], []
-
 SYS = {
- "chat": "Ты MY_AI, ассистент в Telegram и на сайте. Стиль: лаконичный терминальный, можно метки в квадратных скобках. "
-         "Отвечай на языке пользователя, коротко и по делу. Не предлагай взлом, обход защиты и подобное. "
-         "Если приходится остановиться из-за лимита, выдай отчёт: [COMPLETED], [FILE GENERATED], [LIMIT REACHED PREEMPTIVELY], [NEXT STEPS].",
- "vision": "Ты MY_AI. Тебе присылают изображения. Опиши и разбери то, что видишь, по запросу пользователя. Отвечай на его языке, коротко и по делу.",
- "coder": "Ты Агент-Кодер: пишешь и дорабатываешь код, отвечаешь кратко, код в блоках. Без воды.",
- "optimizer": "Ты Агент-Оптимизатор: сжимаешь текст без потери фактов, максимально коротко.",
+    "chat": "Ты MY_AI, ассистент в Telegram и на сайте. Стиль: лаконичный и понятный, без префиксов вроде [MY_AI] в начале ответа. "
+            "Отвечай на языке пользователя, коротко и по делу. Не предлагай взлом, обход защиты и подобное. "
+            "Если приходится остановиться из-за лимита, выдай отчёт: [COMPLETED], [FILE GENERATED], [LIMIT REACHED PREEMPTIVELY], [NEXT STEPS].",
+    "vision": "Ты MY_AI. Тебе присылают изображения. Опиши и разбери то, что видишь, по запросу пользователя. Отвечай на его языке, коротко и по делу.",
+    "coder": "Ты Агент-Кодер: пишешь и дорабатываешь код, отвечаешь кратко, код в блоках. Без воды.",
+    "optimizer": "Ты Агент-Оптимизатор: сжимаешь текст без потери фактов, максимально коротко.",
 }
 PREF = {"coder": ("coder", "qwen", "deepseek", "devstral"),
         "optimizer": ("8b", "7b", "9b", "mini", "small", "flash", "nano", "lite", "gemma"), "chat": ()}
@@ -76,16 +78,13 @@ async def refresh_models():
                                           key=lambda m: -(m.get("context_length") or 0))]
         log.info("free models: %d, with vision: %d", len(FREE), len(VISION))
     except Exception as e: log.error("models: %r", e)
-
 def keys_for(uid):
     env = [k.strip() for k in E("OPENROUTER_KEYS", "").split(",") if k.strip()]
     return env + [k for (k,) in q("select key from keys where owner in (0,?)", uid)]
-
 def models_for(role):
     ms = [m for m in (VISION if role == "vision" else FREE) if cool.get(m, 0) <= time.time()]
     p = [m for m in ms if any(x in m.lower() for x in PREF.get(role, ()))]
     return (p + [m for m in ms if m not in p])[:4]
-
 def reset_at(r):
     h = r.headers
     try:
@@ -93,7 +92,6 @@ def reset_at(r):
         if "x-ratelimit-reset" in h: return float(h["x-ratelimit-reset"]) / 1000
     except ValueError: pass
     return time.time() + 3600
-
 async def llm(msgs, role="chat", uid=0):
     msgs = [{"role": "system", "content": SYS[role]}] + msgs; now = time.time(); STAT["llm"] += 1
     async with httpx.AsyncClient(timeout=60) as c:
@@ -126,7 +124,6 @@ def hload(sid): return [{"role": r, "content": c} for r, c in q("select role,con
 def hadd(sid, role, text):
     q("insert into hist(sid,role,content) values(?,?,?)", sid, role, text)
     q("delete from hist where sid=? and id not in (select id from hist where sid=? order by id desc limit 40)", sid, sid)
-
 async def compress(sid, h, uid):
     if sum(len(x["content"]) for x in h) <= 6000: return h
     old, new = h[:-6], h[-6:]
@@ -135,7 +132,6 @@ async def compress(sid, h, uid):
     q("delete from hist where sid=?", sid)
     for x in [{"role": "user", "content": "Выжимка прошлого: " + s}] + new: hadd(sid, x["role"], x["content"])
     return hload(sid)
-
 async def reply(sid, uid, text, role=None):
     role = role or route(text); ck = None
     h = await compress(sid, hload(sid), uid)
@@ -156,7 +152,6 @@ SPEC = ('Верни ТОЛЬКО JSON без markdown: {"size":[X,Y,Z],"ops":[{"
         'только блоки Minecraft 1.21. Постройка: ')
 def _s(s): b = s.encode(); return struct.pack(">H", len(b)) + b
 def _t(t, n, p): return bytes([t]) + _s(n) + p
-
 def build_schem(spec):
     dim = [int(v) for v in spec["size"]]; W, H, L = dim
     assert all(1 <= v <= 48 for v in dim), "размер 1..48"
@@ -186,7 +181,6 @@ def build_schem(spec):
          _t(10, "Palette", b"".join(_t(3, k, struct.pack(">i", v)) for k, v in pal.items()) + b"\0"),
          _t(7, "BlockData", struct.pack(">i", len(data)) + bytes(data)), _t(11, "Offset", struct.pack(">4i", 3, 0, 0, 0))]
     return gzip.compress(_t(10, "Schematic", b"".join(f) + b"\0")), len(grid), len(pal)
-
 async def mc(uid, desc):
     raw = await llm([{"role": "user", "content": SPEC + desc}], "coder", uid)
     if raw.startswith("[RATE LIMIT"): return raw, None
@@ -204,21 +198,17 @@ def rap_label(x):
     if c.get("sh"): name += " Shiny"
     if c.get("tn"): name += f" T{c['tn']}"
     return name if cat == "Pet" else f"{name} [{cat}]"
-
 async def api_get(path):
     async with httpx.AsyncClient(timeout=40) as c: return (await c.get("https://ps99.biggamesapi.io" + path)).json()
 async def rap_load(): return {rap_label(x): x.get("value", 0) for x in (await api_get("/api/rap"))["data"]}
 async def exists_load(): return {rap_label(x): x.get("value", 0) for x in (await api_get("/api/exists"))["data"]}
-
 def short(v): return f"{v / 1e12:.2f}T" if v >= 1e12 else f"{v / 1e9:.1f}B" if v >= 1e9 else f"{v / 1e6:.1f}M" if v >= 1e6 else f"{v:,}"
-
 async def ps99():
     try: d = await rap_load()
     except Exception as e: return f"[PS99 ERROR] API недоступен: {e!r}"
     top = sorted(d.items(), key=lambda x: -x[1])[:10]
     t = "\n".join(f"{k}: {short(v)}" for k, v in top)
     return "[PS99 RAP TOP-10]\n" + t + "\n\n" + await llm([{"role": "user", "content": "Единицы: T = триллион, B = миллиард. Не меняй единицы и не выдумывай цифры. Дай 2 коротких вывода по рынку PS99:\n" + t}], "chat")
-
 async def inv_report(nick):
     try:
         d = await api_get(f"/v1/players/{nick}?include=inventory")
@@ -230,7 +220,6 @@ async def inv_report(nick):
     rows = sorted(((i.get("displayName") or i.get("id"), i.get("variant"), i.get("count", 1), (i.get("rap") or 0) * (i.get("count") or 1)) for i in items), key=lambda x: -x[3])
     tot = sum(x[3] for x in rows)
     return f"[{nick}] RAP: {short(tot)}, предметов: {len(items)}\n" + "\n".join(f"{n}{' ' + vr if vr else ''} x{c}: {short(val)}" for n, vr, c, val in rows[:12]), tot
-
 NEWCOLS = ("Pets", "Eggs", "Hoverboards", "Booths", "Lootboxes", "Enchants", "Currency", "MiscItems")
 async def ps99_new():
     out = []
@@ -242,7 +231,6 @@ async def ps99_new():
             new = sorted(names - prev); out.append(f"{col}: " + ", ".join(new[:15]) + (f" (+{len(new) - 15})" if len(new) > 15 else ""))
         if prev is None or names != prev: q("insert or replace into settings values(?,?)", "col:" + col, json.dumps(sorted(names)))
     if out: await say(ADMIN, "[PS99 НОВОЕ]\n" + "\n".join(out))
-
 async def ps99_watch():
     for (n,) in q("select nick from accs"):
         _, tot = await inv_report(n)
@@ -252,7 +240,6 @@ async def ps99_watch():
             q("insert or replace into settings values(?,?)", "invtot:" + n, str(tot))
             if old and float(old[0][0]) > 0 and abs(tot - float(old[0][0])) / float(old[0][0]) > 0.02: await say(ADMIN, f"[INV] {n}: {short(int(float(old[0][0])))} -> {short(tot)}")
     if dt.datetime.now(MSK).hour % 3 == 0: await ps99_new()
-
 async def ps99_movers():
     global rap_prev
     try: d = await rap_load()
@@ -261,29 +248,21 @@ async def ps99_movers():
         mv = [(k, rap_prev[k], v) for k, v in d.items() if rap_prev.get(k, 0) > 1e6 and abs(v - rap_prev[k]) / rap_prev[k] > 0.25]
         if mv: await say(ADMIN, "[PS99 MOVERS]\n" + "\n".join(f"{k}: {a:,} -> {b:,}" for k, a, b in mv[:10]))
     rap_prev = d
-
 async def digest():
     async with httpx.AsyncClient(timeout=30) as c:
         try: xml = (await c.get(E("NEWS_RSS", "https://lenta.ru/rss/news"))).text
         except Exception: return "[NEWS ERROR] лента недоступна"
     t = re.findall(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", xml)[1:9]
     return await llm([{"role": "user", "content": "Сделай короткую сводку:\n" + "\n".join(t)}], "optimizer")
-
-VERSION = "1.7"
-CHANGELOG = ["1.7: фото, живой инвентарь PS99, исправлены цены, слежение за новым",
-             "1.6: до 5 копий базы в двух местах, автовыбор свежей и запасной, логи сохраняются",
-             "1.5: отдельный бот для бэкапов (/setbackup, /admin bots)",
-             "1.4: база сама восстанавливается после перезапуска",
-             "1.3: объявления от админа всем (сразу или по расписанию)",
-             "1.2: новости из твоих каналов (RSS, YouTube, Telegram), расписание /time, /sub, /format",
-             "1.1: несколько ИИ-агентов, экономия токенов, общая история веб + бот"]
+VERSION = "0.01"  # Alpha. Дальше микро-шаги: 0.02, 0.03... крупные обновления: 0.1, 0.2... юбилейные: 1.0
+CHANGELOG = ["v0.01 (Alpha): бэкапы идут только в отдельного бота-сейвера (раз в неделю, при наплыве новых людей раз в сутки, не чаще раза в час); "
+             "/admin logs показывает действия по каждому пользователю; админ может скачать базу и настройки файлом и отправить обратно; убран префикс [MY_AI]"]
 
 # ---------- Новости: источники, расписание ----------
 def clean(t): return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html.unescape(t))).strip()
 def kind_of(s):
     if "youtube.com" in s or "youtu.be" in s or re.fullmatch(r"UC[\w-]{22}", s): return "yt"
     return "tg" if s.startswith("@") or "t.me/" in s else "rss"
-
 def parse_rss(x):
     out = []
     for seg in re.split(r"<item[ >]|<entry[ >]", x)[1:9]:
@@ -291,14 +270,12 @@ def parse_rss(x):
         l = re.search(r'<link[^>]*href="([^"]+)"', seg) or re.search(r"<link>\s*(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?\s*</link>", seg, re.S)
         if t and l: out.append((l.group(1).strip(), clean(t.group(1))[:200], l.group(1).strip()))
     return out
-
 def parse_tg(h):
     out = []
     for seg in h.split('data-post="')[1:][-8:]:
         post = seg.split('"')[0]; m = re.search(r'tgme_widget_message_text[^>]*>(.*?)</div>', seg, re.S)
         if m and clean(m.group(1)): out.append((post, clean(m.group(1))[:200], "https://t.me/" + post))
     return out[::-1]
-
 async def norm_source(s):
     k = kind_of(s)
     if k == "tg":
@@ -315,7 +292,6 @@ async def norm_source(s):
         return k, m.group(1)
     if not s.startswith("http"): raise ValueError("нужна ссылка на RSS, @канал или YouTube")
     return k, s
-
 srccache = {}
 async def fetch_items(kind, url):
     ck = (kind, url)
@@ -328,7 +304,6 @@ async def fetch_items(kind, url):
             else: items = parse_rss((await c.get(url)).text)
     except Exception as e: log.error("source %s: %r", url[:40], e)
     srccache[ck] = (time.time() + 300, items); return items
-
 async def collect(uid, only_new):
     out = []
     for kind, url, title in q("select kind,url,title from sources where owner in (0,?)", uid):
@@ -336,16 +311,13 @@ async def collect(uid, only_new):
             if only_new and q("select 1 from seen where uid=? and key=?", uid, key): continue
             out.append((title or url, key, t, l))
     return out
-
 def get_sub(uid): return (q("select active,times,fmt from subs where uid=?", uid) or [(0, "09:00,21:00", "ai")])[0]
-
 async def fmt_digest(uid, items, fmt):
     items = items[:15]; head = ""
     if fmt == "ai":
         head = await llm([{"role": "user", "content": "Коротко, 2-3 предложения: о чём эти новости:\n" + "\n".join(i[2] for i in items)}], "optimizer", uid)
         head = "" if head.startswith("[RATE LIMIT") else head + "\n\n"
     return head + "\n\n".join(f"• [{s}] {t}\n{l}" for s, _, t, l in items)
-
 async def job_digests(hhmm):
     for uid, times, fmt in q("select uid,times,fmt from subs where active=1"):
         if hhmm not in times.split(","): continue
@@ -369,13 +341,12 @@ def parse_when(arg):
         h, mi, t = m.groups(); w = n.replace(hour=int(h), minute=int(mi), second=0, microsecond=0)
         return (w + dt.timedelta(days=1) if w <= n else w), t
     return n, arg
-
 async def job_posts(_=None):
     now = dt.datetime.now(MSK).strftime("%Y-%m-%d %H:%M")
     for pid, text in q("select id,text from posts where sent=0 and at<=?", now):
         q("update posts set sent=1 where id=?", pid); n = 0
         for (i,) in q("select id from users where banned=0"):
-            try: await say(i, "[MY_AI] " + text); n += 1
+            try: await say(i, text); n += 1
             except Exception: pass
             await asyncio.sleep(0.05)
         await say(ADMIN, f"[POST #{pid}] доставлено: {n}")
@@ -385,16 +356,106 @@ async def tg(method, token=None, **kw):
     async with httpx.AsyncClient(timeout=70) as c: return (await c.post(f"{TGAPI}/bot{token or BOT}/{method}", **kw)).json()
 async def say(chat, text, token=None, **kw):
     for i in range(0, max(len(text), 1), 4000): await tg("sendMessage", token, json={"chat_id": chat, "text": text[i:i + 4000], **kw})
-
-HELP = ("[MY_AI] Просто пиши, отвечу.\n\nНовости:\n/news - свежее из источников\n/sources - список\n/addsource ссылка - добавить (RSS, @канал Telegram, YouTube)\n"
+HELP = ("Просто пиши, отвечу.\n\nНовости:\n/news - свежее из источников\n/sources - список\n/addsource ссылка - добавить (RSS, @канал Telegram, YouTube)\n"
         "/delsource N - удалить\n/sub on|off - рассылка\n/time 09:00 21:00 - когда слать (МСК)\n/format ai|short - с кратким пересказом или только заголовки\n/updates - что нового\n\n"
         "Фото: пришли картинку с подписью-вопросом, разберу.\n/nick имя1 имя2 - свободны ли ники Minecraft.\nДругое: /key add|list|del - свой ключ OpenRouter, /agent coder|chat|auto, /link, /clear, /migrate_chat\n"
         "Ключ: openrouter.ai -> Keys -> Create Key, затем /key add sk-or-...")
-HELP_ADMIN = "\n\nАдмин: /admin, /mc описание, /news ps99\n/post текст - всем сразу; /post 18:30 текст; /post 05.11 18:30 текст\n/posts, /delpost N\n/acc add НикRoblox - привязать аккаунт PS99, /inv - живой инвентарь с RAP\n/price имя - цены всех вариантов, /new - что нового в игре\n/admin backup - новая копия сейчас, /admin backups - список копий, /admin restore yes - восстановить, /admin bots - проверка ботов\n/setbackup ТОКЕН - привязать бота бэкапов\n/addsource all ссылка - общий источник (без all - только твой)"
-ADMIN_SUBS = {"users", "ban", "unban", "viewkeys", "createcmd", "keypool", "status", "backup", "bots", "backups", "restore", "addkey", "logs", "broadcast", "health", "agents", "cachecl"}
+HELP_ADMIN = ("\n\nАдмин: /admin, /mc описание, /news ps99\n/post текст - всем сразу; /post 18:30 текст; /post 05.11 18:30 текст\n/posts, /delpost N\n"
+              "/acc add НикRoblox - привязать аккаунт PS99, /inv - живой инвентарь с RAP\n/price имя - цены всех вариантов, /new - что нового в игре\n"
+              "/admin logs [N] - действия по каждому пользователю (последние N, по умолчанию 10); /admin logs sys [N] - технические логи\n"
+              "/admin get_db - прислать базу файлом (.db); /admin get_config - прислать настройки (config.json). "
+              "Изменённый config.json просто отправь боту документом; .db - с подписью /admin set_db yes\n"
+              "/admin backup - бэкап в бота-сейвера сейчас, /admin backups - список копий и режим, /admin restore yes - восстановить, /admin bots - проверка ботов\n"
+              "/setbackup ТОКЕН - привязать бота-сейвера\n/addsource all ссылка - общий источник (без all - только твой)")
+ADMIN_SUBS = {"users", "ban", "unban", "viewkeys", "createcmd", "keypool", "status", "backup", "bots", "backups", "restore", "addkey", "logs", "broadcast", "health", "agents", "cachecl", "get_db", "get_config"}
 MENU = {"inline_keyboard": [[{"text": "Новости", "callback_data": "/news"}, {"text": "Рассылка вкл", "callback_data": "/sub on"}],
-                             [{"text": "Источники", "callback_data": "/sources"}, {"text": "Справка", "callback_data": "/help"}]]}
+                            [{"text": "Источники", "callback_data": "/sources"}, {"text": "Справка", "callback_data": "/help"}]]}
 def mask(k): return k[:8] + "..." + k[-4:]
+
+# ---------- Журнал действий по пользователям (/admin logs) ----------
+def user_logs(arg):
+    n = min(int(arg), 50) if arg.isdigit() else 10
+    g, tot = collections.OrderedDict(), collections.Counter()  # g: самые свежие действия, порядок - по последней активности
+    for uid, at, what in q("select uid,at,what from ulogs order by id desc"):
+        tot[uid] += 1
+        if len(g.setdefault(uid, [])) < n: g[uid].append((at, what))
+    names = dict(q("select id,name from users"))
+    return "\n\n".join(f"{uid} / {names.get(uid) or '-'} (всего действий: {tot[uid]})\n" + "\n".join(f"  {at} - {w}" for at, w in l[::-1]) for uid, l in g.items()) or "действий пока нет"
+
+# ---------- Файлы настроек для админа (/admin get_config) ----------
+CFG_DEFAULT = {"backup": {"interval_days": 7, "surge_interval_hours": 24, "surge_new_users": 20, "min_gap_minutes": 60, "keep": 5}}
+CFG_README = ("Файл настроек бота. Поменяй значения и отправь файл обратно боту (как документ). "
+              "backup.interval_days - как часто делать бэкап (дней). backup.surge_new_users - сколько новых людей за сутки считается наплывом. "
+              "backup.surge_interval_hours - при наплыве бэкап не чаще, чем раз в столько часов. backup.min_gap_minutes - минимальный перерыв между бэкапами (не меньше 60). "
+              "backup.keep - сколько копий хранить. commands - свои команды {имя: ответ}. shared_sources - общие источники новостей (kind: rss, tg или yt).")
+def bcfg():
+    try: c = json.loads(getv("config") or "{}").get("backup") or {}
+    except Exception: c = {}
+    return {**CFG_DEFAULT["backup"], **{k: c[k] for k in CFG_DEFAULT["backup"] if isinstance(c.get(k), (int, float)) and not isinstance(c.get(k), bool) and c[k] > 0}}
+def cfg_export():
+    return {"_readme": CFG_README, "version": VERSION, "backup": bcfg(), "commands": dict(q("select name,text from cmds")),
+            "shared_sources": [{"kind": k, "url": u, "title": t} for k, u, t in q("select kind,url,title from sources where owner=0")]}
+def apply_config(d):
+    if not isinstance(d, dict): raise ValueError("файл должен начинаться с { и заканчиваться }")
+    cur, cm, want = bcfg(), None, None
+    b = d.get("backup")
+    if b is not None:
+        if not isinstance(b, dict): raise ValueError("backup должен быть блоком { ... }")
+        for k, lo, hi in (("interval_days", 1, 60), ("surge_interval_hours", 1, 168), ("surge_new_users", 1, 100000), ("min_gap_minutes", 60, 10080), ("keep", 2, 10)):
+            if k in b:
+                if isinstance(b[k], bool) or not isinstance(b[k], (int, float)) or not lo <= b[k] <= hi: raise ValueError(f"backup.{k}: нужно число от {lo} до {hi}")
+                cur[k] = b[k]
+    if d.get("commands") is not None:
+        cm = d["commands"]
+        if not isinstance(cm, dict): raise ValueError("commands должен быть блоком { \"имя\": \"ответ\" }")
+        for n, t in cm.items():
+            if not re.fullmatch(r"[a-z0-9_]{1,32}", n) or not isinstance(t, str) or not t.strip(): raise ValueError(f"команда {n!r}: имя из a-z, 0-9, _ и непустой текст")
+    if d.get("shared_sources") is not None:
+        ss = d["shared_sources"]
+        if not isinstance(ss, list): raise ValueError("shared_sources должен быть списком [ ... ]")
+        want = {}
+        for s in ss:
+            if not isinstance(s, dict) or s.get("kind") not in ("rss", "tg", "yt") or not isinstance(s.get("url"), str) or not s["url"].strip():
+                raise ValueError("shared_sources: у каждого источника нужны kind (rss, tg или yt) и url")
+            want[(s["kind"], s["url"].strip())] = str(s.get("title") or s["url"])[:40]
+    q("insert or replace into settings values('config',?)", json.dumps({"backup": cur})); out = ["бэкапы: " + ", ".join(f"{k}={v}" for k, v in cur.items())]
+    if cm is not None:
+        q("delete from cmds")
+        for n, t in cm.items(): q("insert into cmds values(?,?)", n, t)
+        out.append(f"команды: {len(cm)}")
+    if want is not None:
+        have = {(k, u): i for i, k, u in q("select id,kind,url from sources where owner=0")}
+        for key, i in have.items():
+            if key not in want: q("delete from sources where id=?", i)
+        for (k, u), t in want.items():
+            if (k, u) not in have: q("insert or ignore into sources(owner,kind,url,title) values(0,?,?,?)", k, u, t)
+        out.append(f"общие источники: {len(want)}")
+    return "\n".join(out)
+async def apply_db(blob):
+    open("/tmp/upload.db", "wb").write(blob)
+    if not valid_db("/tmp/upload.db"): raise ValueError("файл не открывается как база бота (повреждён или нет таблицы users)")
+    b = sqlite3.connect("/tmp/before_restore.db"); db.backup(b); b.close()  # на всякий случай запоминаем текущую базу
+    src = sqlite3.connect("/tmp/upload.db"); src.backup(db); src.close(); db.executescript(SCHEMA)
+async def send_admin_file(uid, sub):
+    if sub == "get_db":
+        flush_logs(); dst = sqlite3.connect("/tmp/export.db"); db.backup(dst); dst.close(); blob = open("/tmp/export.db", "rb").read()
+        if len(blob) > 49_000_000: return await say(uid, "[ERROR] база больше 50 МБ, Telegram не даёт боту прислать такой файл")
+        return await tg("sendDocument", data={"chat_id": uid, "caption": "База бота (SQLite). Внутри ключи пользователей, не пересылай её. Вернуть правки: отправь файл обратно с подписью /admin set_db yes"},
+                        files={"document": ("data.db", blob)})
+    blob = json.dumps(cfg_export(), ensure_ascii=False, indent=2).encode()
+    await tg("sendDocument", data={"chat_id": uid, "caption": "Настройки бота. Отредактируй и отправь файл обратно сюда документом."}, files={"document": ("config.json", blob)})
+async def admin_upload(m, uid):
+    d = m["document"]; name = (d.get("file_name") or "").lower(); cap = (m.get("caption") or "").lower().split()
+    if not name.endswith((".json", ".db")): return await say(uid, "Принимаю только config.json (настройки) или .db (база).")
+    if d.get("file_size", 0) > 20_000_000: return await say(uid, "[ERROR] файл больше 20 МБ, Telegram не даёт боту его скачать")
+    if name.endswith(".db") and "yes" not in cap: return await say(uid, "Это заменит ВСЮ базу бота. Чтобы подтвердить, отправь файл ещё раз с подписью: /admin set_db yes")
+    info = (await tg("getFile", json={"file_id": d["file_id"]})).get("result") or {}
+    if not info.get("file_path"): return await say(uid, "[ERROR] не смог скачать файл")
+    async with httpx.AsyncClient(timeout=60) as c: blob = (await c.get(f"{TGAPI}/file/bot{BOT}/{info['file_path']}")).content
+    try:
+        if name.endswith(".json"): return await say(uid, "[OK] настройки применены:\n" + apply_config(json.loads(blob.decode("utf-8-sig"))))
+        await apply_db(blob); return await say(uid, "[OK] база заменена. Прежняя сохранена на сервере до перезапуска.")
+    except ValueError as e: return await say(uid, f"[ОШИБКА] {e}\nНичего не изменено.")
 
 async def admin(sub, arg):
     if sub == "users": return "\n".join(f"{i} {n} {'BAN' if b else ''}" for i, n, b in q("select id,name,banned from users")) or "пусто"
@@ -405,12 +466,21 @@ async def admin(sub, arg):
         now = time.time(); ks = keys_for(0)
         return f"пул: {len(ks)}\n" + "\n".join(f"{mask(k)} {'cooldown %dс' % (cool[k] - now) if cool.get(k, 0) > now else 'OK'}" for k in ks)
     if sub == "createcmd" and " " in arg: n, _, t = arg.partition(" "); q("insert or replace into cmds values(?,?)", n.lstrip("/").lower(), t); return "[OK] /" + n.lstrip("/")
-    if sub == "logs": flush_logs(); return "\n".join(l for (l,) in q("select line from logs order by id desc limit ?", int(arg) if arg.isdigit() else 25)[::-1]) or "логи пусты"
+    if sub == "logs":
+        p = arg.split()
+        if p and p[0] == "sys":
+            flush_logs(); return "\n".join(l for (l,) in q("select line from logs order by id desc limit ?", int(p[1]) if len(p) > 1 and p[1].isdigit() else 25)[::-1]) or "логи пусты"
+        return user_logs(arg)
+    if sub in ("get_db", "get_config"): return "Эта команда работает только в Telegram: файл приходит в чат."
     if sub == "backup":
         err = await job_backup(force=True)
-        return "[OK] бэкап отправлен и закреплён" if not err else f"[BACKUP ERROR] {err}\nОткрой бота бэкапов и нажми /start, потом снова /admin backup"
+        if err: return f"[BACKUP ERROR] {err}"
+        return "[OK] бэкап отправлен в бота-сейвера" + (f" (файл слишком большой: {STAT['cut']} самых новых пользователей уйдут в следующий бэкап)" if STAT["cut"] else "")
     if sub == "backups":
-        c = await bk_scan(); return "\n".join(f"{i}. {l}" for i, (_, _, _, l) in enumerate(c, 1)) or "бэкапов нет"
+        c = await bk_scan(); iv, surge, n24 = bk_interval(); last = float(getv("last_backup") or 0)
+        head = (f"Режим: {'наплыв' if surge else 'обычный'}, новых за 24 ч: {n24}. Бэкап не чаще чем раз в {iv / 3600:.0f} ч. "
+                f"Последний: {dt.datetime.fromtimestamp(last, MSK):%d.%m %H:%M}" if last else "Последнего бэкапа ещё не было.")
+        return head + "\n" + ("\n".join(f"{i}. {l}" for i, (_, _, _, l) in enumerate(c, 1)) or "бэкапов нет")
     if sub == "restore":
         if arg != "yes": return "Заменит текущую базу самой свежей рабочей копией. Подтверди: /admin restore yes"
         return "[RESTORE] " + await restore(force=True)
@@ -420,7 +490,7 @@ async def admin(sub, arg):
             except Exception: return "Telegram недоступен"
         t, c = bk_target()
         return ("Чат-бот: " + (await chk(BOT) if BOT else "BOT_TOKEN не задан") + "\nБот бэкапов: "
-                + ("не привязан, копии идут в чат-бот" if t == BOT else await chk(t) + f" (чат {c})") + "\nБаза: " + ("есть изменения" if dirty else "бэкап свежий"))
+                + ("НЕ ПРИВЯЗАН, автобэкапы выключены. /setbackup ТОКЕН" if not t else await chk(t) + f" (чат {c})") + "\nБаза: " + ("есть изменения" if dirty else "бэкап свежий"))
     if sub == "cachecl": cache.clear(); return "[OK] кэш очищен"
     if sub == "agents": return "\n".join(f"{r}: {', '.join(models_for(r)) or 'нет free-моделей -> Pollinations'}" for r in ("coder", "optimizer", "chat"))
     if sub == "broadcast" and arg:
@@ -431,9 +501,9 @@ async def admin(sub, arg):
             await asyncio.sleep(0.05)
         return f"[BROADCAST] доставлено {n}"
     up = int(time.time() - T0)
-    return (f"[STATUS] up={up // 3600}ч{up % 3600 // 60}м users={len(q('select id from users'))} keys={len(keys_for(0))} free_models={len(FREE)} "
+    return (f"[STATUS] v{VERSION} up={up // 3600}ч{up % 3600 // 60}м users={len(q('select id from users'))} keys={len(keys_for(0))} free_models={len(FREE)} "
             f"llm_calls={STAT['llm']} cache_hits={STAT['cache']} bot={STAT['bot']} err={STAT['err'][:80]}\n"
-            "Команды: users, ban/unban ID, broadcast ТЕКСТ, logs [N], agents, cachecl, keypool, viewkeys, addkey, createcmd, health")
+            "Команды: users, ban/unban ID, broadcast ТЕКСТ, logs [N|sys], get_db, get_config, backup, backups, bots, restore, agents, cachecl, keypool, viewkeys, addkey, createcmd, health")
 
 def pick_photo(m):
     if m.get("photo"):
@@ -441,14 +511,12 @@ def pick_photo(m):
         return ph[-1]["file_id"]
     d = m.get("document") or {}
     if d.get("mime_type", "").startswith("image/") and d.get("file_size", 0) <= 5_000_000: return d["file_id"]
-
 async def mc_free(name):
     if not (name.isascii() and re.fullmatch(r"\w{3,16}", name)): return "неверный формат (3-16 символов: буквы, цифры, _)"
     try:
         async with httpx.AsyncClient(timeout=15) as c: r = await c.get("https://api.minecraftservices.com/minecraft/profile/lookup/name/" + name)
     except Exception: return "не удалось проверить"
     return "занят" if r.status_code == 200 else "свободен (по данным Mojang)" if r.status_code == 404 else f"не знаю (код {r.status_code})"
-
 async def handle_photo(m, uid):
     cap = (m.get("caption") or "").strip() or "Опиши, что на изображении, и ответь по делу."
     await tg("sendChatAction", json={"chat_id": uid, "action": "typing"})
@@ -461,19 +529,21 @@ async def handle_photo(m, uid):
                     {"type": "image_url", "image_url": {"url": f"data:{mime};base64," + base64.b64encode(blob).decode()}}]}], "vision", uid)
     if not out.startswith("[RATE LIMIT"): hadd(sid, "user", "[фото] " + cap); hadd(sid, "assistant", out)
     await say(uid, out)
-
 async def handle(m):
     u = m["from"]; uid = u["id"]; txt = (m.get("text") or "").strip()
-    if not txt and not pick_photo(m): return
+    if not txt and not pick_photo(m) and not (uid == ADMIN and m.get("document")): return
     row = q("select banned from users where id=?", uid)
     if not row:
         q("insert into users values(?,?,0,?)", uid, u.get("first_name", ""), dt.datetime.now().isoformat())
         await say(ADMIN, f"[NEW USER] {uid} {u.get('first_name', '')}")
     elif row[0][0]: return
-    if not txt: return await handle_photo(m, uid)
+    act(uid, ("фото" if pick_photo(m) else "файл") if not txt else txt.split()[0].split("@")[0].lower() if txt.startswith("/") else f"сообщение, {len(txt)} симв.")
+    if not txt:
+        if uid == ADMIN and m.get("document") and not pick_photo(m): return await admin_upload(m, uid)
+        return await handle_photo(m, uid)
     cmd, _, arg = txt.partition(" "); cmd = cmd.split("@")[0].lower(); arg = arg.strip(); sid = f"tg:{uid}"
     r = lambda s, **kw: say(uid, s, **kw)
-    if cmd == "/start": return await r("[MY_AI // TERMINAL READY] Выбери модуль или просто пиши:", reply_markup=MENU)
+    if cmd == "/start": return await r("Привет! Выбери действие или просто напиши вопрос:", reply_markup=MENU)
     if cmd == "/help": return await r(HELP + (HELP_ADMIN if uid == ADMIN else ""))
     if cmd == "/clear": q("delete from hist where sid=?", sid); return await r("[OK] чат очищен")
     if cmd == "/news":
@@ -506,7 +576,7 @@ async def handle(m):
             q("update subs set times=? where uid=?", ",".join(ts), uid)
         a, t, f = get_sub(uid); return await r(f"[РАССЫЛКА] {'ВКЛ' if a else 'ВЫКЛ'}, время: {t} (МСК), формат: {f}. Приходит только новое.")
     if cmd == "/updates":
-        a, t, f = get_sub(uid); return await r(f"[v{VERSION}]\n" + "\n".join(CHANGELOG) + f"\n\nТвоя рассылка: {'ВКЛ' if a else 'ВЫКЛ'}, {t} МСК")
+        a, t, f = get_sub(uid); return await r(f"Версия v{VERSION} (Alpha)\n" + "\n".join(CHANGELOG) + f"\n\nТвоя рассылка: {'ВКЛ' if a else 'ВЫКЛ'}, {t} МСК")
     if uid == ADMIN and cmd == "/post":
         if not arg: return await r("Всем сразу: /post текст\nНа время: /post 18:30 текст\nНа дату: /post 05.11 18:30 текст")
         try: w, t = parse_when(arg)
@@ -588,18 +658,17 @@ async def handle(m):
         return await r("\n".join(f"{i}. {mask(k)}" for i, (k,) in enumerate(ks, 1)) or "ключей нет. /key add sk-or-...")
     if uid == ADMIN and (cmd == "/admin" or cmd[1:] in ADMIN_SUBS):
         sub, a = (arg.split(" ", 1) + [""])[:2] if cmd == "/admin" else (cmd[1:], arg)
-        return await r(await admin(sub.lower(), a.strip()))
+        sub = sub.lower()
+        if sub in ("get_db", "get_config"): return await send_admin_file(uid, sub)
+        return await r(await admin(sub, a.strip()))
     c = q("select text from cmds where name=?", cmd.lstrip("/"))
     if c: return await r(c[0][0])
     if cmd.startswith("/"): return await r("Не знаю такой команды. /help")
     await r(await reply(sid, uid, txt, hist_pref.get(uid)))
-
 def hist_load_tail(sid): return hload(sid)[-10:]
-
 async def safe(m):
     try: await handle(m)
     except Exception as e: log.exception("handle: %r", e)
-
 async def poll():
     off = 0
     try:
@@ -648,25 +717,46 @@ async def job_streams(_=None):
             for n, tt in live.items():
                 if n not in live_tw: await say(ADMIN, f"[TWITCH LIVE] {n}: {tt}")
             live_tw.clear(); live_tw.update(live)
-KEEP, GAP = 5, 6 * 3600   # хранить 5 копий; новая копия заменяет самую свежую, если ей меньше 6 часов
+
+# ---------- Бэкапы: ТОЛЬКО в отдельного бота-сейвера ----------
+# Обычно раз в неделю. Если за сутки пришло много новых людей (наплыв), бэкап чаще, но НЕ чаще раза в час.
+# Если база не влезает в лимит Telegram (50 МБ), самые новые пользователи не попадают в эту копию и уходят в следующую.
+# Все числа можно менять через /admin get_config (блок backup).
+GAP, MAXB = 6 * 3600, int(float(E("BACKUP_MAX_MB", "45")) * 1024 * 1024)  # GAP: ручной бэкап заменяет самую свежую копию, если ей меньше 6 часов
 last_bk = {}
+PER_USER = (("keys", "owner"), ("subs", "uid"), ("seen", "uid"), ("links", "uid"), ("sources", "owner"), ("ulogs", "uid"))
 def chat_for(t): return ADMIN if t == BOT else (E("BACKUP_CHAT_ID") or ADMIN)
 def who(t): return "чат-бот" if t == BOT else "бот бэкапов"
 def bk_target():
-    t = (q("select v from settings where k='backup_token'") or [(None,)])[0][0] or E("BACKUP_BOT_TOKEN")
-    return (t, chat_for(t)) if t else (BOT, ADMIN)
-
+    t = getv("backup_token") or E("BACKUP_BOT_TOKEN")
+    return (t, chat_for(t)) if t else (None, None)  # без бота-сейвера автобэкапов нет: в основной бот ничего не шлём
+def bk_interval():
+    c = bcfg(); n24 = q("select count(*) from users where joined>=?", (dt.datetime.now() - dt.timedelta(hours=24)).isoformat())[0][0]
+    surge = n24 >= c["surge_new_users"]
+    return max(c["surge_interval_hours"] * 3600 if surge else c["interval_days"] * 86400, max(c["min_gap_minutes"], 60) * 60), surge, n24
 def valid_db(path):
     try:
         c = sqlite3.connect(path)
         ok = c.execute("pragma integrity_check").fetchone()[0] == "ok" and c.execute("select 1 from sqlite_master where name='users'").fetchone() is not None
         c.close(); return ok
     except Exception: return False
-
+def trim_snapshot(snap, limit):
+    cut, c = 0, sqlite3.connect(snap)  # работаем только с копией, живая база не трогается
+    try:
+        while os.path.getsize(snap) > limit:
+            total = c.execute("select count(*) from users").fetchone()[0]
+            if total <= 1: break
+            ids = [i for (i,) in c.execute("select id from users order by joined desc limit ?", (max(1, total // 10),))]
+            for i in ids:
+                for t, col in PER_USER: c.execute(f"delete from {t} where {col}=?", (i,))
+                c.execute("delete from hist where sid=?", (f"tg:{i}",)); c.execute("delete from users where id=?", (i,))
+            c.commit(); c.execute("vacuum"); cut += len(ids)
+    finally: c.close()
+    return cut
 async def send_backup(token, chat, snap, new_gen):
-    prev, now = last_bk.get(token, []), int(time.time())
-    if prev and not new_gen and now - prev[0][2] < GAP: keep, drop = prev[1:KEEP], [prev[0]] + prev[KEEP:]
-    else: keep, drop = prev[:KEEP - 1], prev[KEEP - 1:]
+    prev, now, keep_n = last_bk.get(token, []), int(time.time()), int(bcfg()["keep"])
+    if prev and not new_gen and now - prev[0][2] < GAP: keep, drop = prev[1:keep_n], [prev[0]] + prev[keep_n:]
+    else: keep, drop = prev[:keep_n - 1], prev[keep_n - 1:]
     cap = f"BACKUP v1 {dt.datetime.now(MSK):%d.%m.%Y %H:%M} МСК | " + ",".join(f"{a}:{b}:{c}" for a, b, c in keep)
     with open(snap, "rb") as f:
         r = await tg("sendDocument", token, data={"chat_id": chat, "caption": cap, "disable_notification": "true"}, files={"document": ("backup.db", f)})
@@ -675,26 +765,22 @@ async def send_backup(token, chat, snap, new_gen):
     await tg("pinChatMessage", token, json={"chat_id": chat, "message_id": mid, "disable_notification": True})
     for a, _, _ in drop: await tg("deleteMessage", token, json={"chat_id": chat, "message_id": int(a)})
     last_bk[token] = [(mid, fid, now)] + keep
-
 async def job_backup(_=None, force=False):
     global dirty
-    if not (dirty or force): return
+    tok, chat = bk_target()
+    if not tok: return "бот бэкапов не привязан. Добавь BACKUP_BOT_TOKEN в Render или напиши /setbackup ТОКЕН" if force else None
+    if not force and (not dirty or time.time() - float(getv("last_backup") or 0) < bk_interval()[0]): return
     if not q("select count(*) from users")[0][0]: return "база пустая, бэкап пропущен (чтобы не затереть хорошие копии)"
-    dest = []
-    for t in (bk_target()[0], BOT):
-        if t and t not in dest: dest.append(t)
-    flush_logs(); dirty = False; db.commit(); snap = "/tmp/snap.db"
-    dst = sqlite3.connect(snap); db.backup(dst); dst.close(); errs = []
-    for t in dest:
-        e = await send_backup(t, chat_for(t), snap, force)
-        if e: errs.append(f"{who(t)}: {e}")
-    if errs: log.error("backup: %s", errs)
-    if len(errs) == len(dest): dirty = True
-    return "; ".join(errs) or None
-
+    STAT["cut"] = 0; flush_logs(); prev = getv("last_backup"); setv("last_backup", int(time.time())); dirty = False; snap = "/tmp/snap.db"
+    try:
+        dst = sqlite3.connect(snap); db.backup(dst); dst.close(); STAT["cut"] = trim_snapshot(snap, MAXB)
+        err = "файл базы больше лимита Telegram (50 МБ), бэкап невозможен" if os.path.getsize(snap) > MAXB else await send_backup(tok, chat, snap, force)
+    except Exception as e: err = repr(e)
+    if err: setv("last_backup", prev or 0); dirty = True; log.error("backup: %s", err); return err
+    if STAT["cut"]: log.info("backup: %d новых пользователей перенесены в следующий бэкап (файл не влез)", STAT["cut"])
 async def bk_scan():
     cands, seen = [], set()
-    for token in (bk_target()[0], E("BACKUP_BOT_TOKEN"), BOT):
+    for token in (bk_target()[0], E("BACKUP_BOT_TOKEN"), BOT):  # BOT - только чтобы найти старые копии, сделанные до v0.01
         if not token or token in seen: continue
         seen.add(token)
         try: pm = (await tg("getChat", token, json={"chat_id": chat_for(token)})).get("result", {}).get("pinned_message") or {}
@@ -706,10 +792,9 @@ async def bk_scan():
             x = p.split(":")
             if len(x) == 3 and x[0].isdigit() and x[2].isdigit(): old.append((int(x[0]), x[1], int(x[2])))
         chain = [(pm["message_id"], d["file_id"], pm["date"])] + old
-        last_bk.setdefault(token, chain[:KEEP])
+        last_bk.setdefault(token, chain[:int(bcfg()["keep"])])
         for _, fid, ts in chain: cands.append((ts, token, fid, f"{who(token)}, {dt.datetime.fromtimestamp(ts, MSK):%d.%m %H:%M}"))
     return sorted(cands, reverse=True)
-
 async def restore(force=False):
     if not BOT or not ADMIN: return "бот не настроен"
     if not force and q("select count(*) from users")[0][0]: await bk_scan(); return "база на месте"
@@ -726,15 +811,13 @@ async def restore(force=False):
             log.info("restore: восстановлено из %s", label); return f"восстановлено из копии ({label})"
         except Exception as e: log.error("restore %s: %r", label, e)
     return "ни одна копия не открылась"
-
 JOBS = {"dg": job_digests, "news": job_news, "yt": job_streams, "bk": job_backup, "mod": job_mod, "ping": job_ping}
-
 async def sched():
     done = set()
     while True:
         n = dt.datetime.now(MSK)
         for tag, ok in (("dg-" + n.strftime("%F-%H:%M"), True), ("news-" + n.strftime("%F-%H"), n.hour in (10, 21)), ("yt-" + n.strftime("%F-%H"), True),
-                        ("bk-" + n.strftime("%F-%H-") + str(n.minute // 30), True),
+                        ("bk-" + n.strftime("%F-%H-") + str(n.minute // 30), True),  # проверка раз в 30 мин: пора ли делать бэкап (решает job_backup по интервалу)
                         ("mod-" + n.strftime("%F-") + str(n.hour // 6), True), ("ping-" + n.strftime("%F-%H-") + str(n.minute // 10), True)):
             if ok and tag not in done:
                 done.add(tag); asyncio.create_task(JOBS[tag.split("-")[0]](n.strftime("%H:%M")))
@@ -745,7 +828,6 @@ async def sched():
 # ---------- Agent-Integrator: веб <-> Telegram ----------
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=[o for o in E("WEB_ORIGIN", "*").split(",")], allow_methods=["*"], allow_headers=["*"])
-
 @app.on_event("startup")
 async def start():
     rs = await restore(); log.info("start v%s: %s", VERSION, rs)
@@ -753,18 +835,14 @@ async def start():
         q("insert into sources(owner,kind,url,title) values(0,'rss',?,'Лента.ру')", E("NEWS_RSS", "https://lenta.ru/rss/news"))
     asyncio.create_task(refresh_models()); asyncio.create_task(sched())
     if BOT:
-        asyncio.create_task(poll()); asyncio.create_task(say(ADMIN, f"[DEPLOY] v{VERSION}: сервис перезапущен. База: {rs}. Пиши сюда, разберём правки."))
-
+        asyncio.create_task(poll()); asyncio.create_task(say(ADMIN, f"[DEPLOY] v{VERSION}: сервис перезапущен. База: {rs}."))
 @app.get("/api/health")
 def health(): return {"bot": STAT["bot"], "err": STAT["err"], "keys": len(keys_for(0)), "free_models": len(FREE), "pollinations": bool(PKEY), "admin_set": bool(ADMIN)}
-
 @app.get("/")
 def index(): return FileResponse("index.html")
-
 def web_sid(cid, chat):
     r = q("select uid from links where cid=?", cid)
     return (f"tg:{r[0][0]}", r[0][0]) if r else (f"web:{cid}:{chat}", 0)
-
 @app.post("/api/chat")
 async def chat(req: Request):
     ip, now = req.headers.get("x-forwarded-for", req.client.host).split(",")[0], time.time()
@@ -776,7 +854,6 @@ async def chat(req: Request):
     sid, uid = web_sid(cid, str(b.get("chat", ""))[:20])
     if uid and q("select banned from users where id=?", uid) == [(1,)]: return JSONResponse({"reply": "[BANNED]"}, 403)
     return {"reply": await reply(sid, uid, text, hist_pref.get(uid))}
-
 @app.post("/api/link")
 async def link(req: Request):
     b = await req.json(); p = pending.get(str(b.get("code", "")))
@@ -784,7 +861,6 @@ async def link(req: Request):
     q("insert or replace into links values(?,?)", str(b.get("cid", ""))[:40], p[0]); pending.pop(str(b["code"]), None)
     await say(p[0], "[LINK] Веб-терминал привязан: история общая.")
     return {"reply": "[LINK OK] история теперь общая с Telegram"}
-
 @app.post("/api/admin/{sub}")
 async def adm(sub: str, req: Request):
     if not ADMIN_TOKEN or not hmac.compare_digest(req.headers.get("x-admin-token", ""), ADMIN_TOKEN): return JSONResponse({"error": "forbidden"}, 403)
