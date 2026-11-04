@@ -603,6 +603,7 @@ def get_sub(uid):
     return r[0] if r else (*sub_default(uid), "ai")
 headcache, warmed = {}, set()
 NEWS_BATCH = max(1, min(int(float(E("NEWS_BATCH", "20"))), 30))  # сколько человек за раз (Telegram: около 30 сообщений в секунду всего)
+BOOT_AT = dt.datetime.now(MSK)  # слоты рассылки, которые прошли до запуска процесса, после перезапуска не досылаются
 DGF, DG_LATE, DG_WARM = "%Y-%m-%d %H:%M", dt.timedelta(hours=6), dt.timedelta(minutes=20)
 def _w(t): return set(re.findall(r"\w{3,}", t.lower()))
 def merge_dups(items):
@@ -654,7 +655,7 @@ async def job_digests(_=None):
             for t in times.split(","):
                 try: h, mi = map(int, t.split(":")); sl = now.replace(hour=h, minute=mi, second=0, microsecond=0)
                 except ValueError: continue
-                if sl <= now and now - sl <= DG_LATE and sl.strftime(DGF) > last: ok.append(sl.strftime(DGF))  # догонялка: слот был, а выпуска нет
+                if BOOT_AT < sl <= now and now - sl <= DG_LATE and sl.strftime(DGF) > last: ok.append(sl.strftime(DGF))  # догонялка: слот был, а выпуска нет
                 elif now < sl <= now + DG_WARM: warm.append((uid, fmt, sl.strftime(DGF)))
             if ok: due.append((uid, fmt, max(ok)))
         due.sort(key=lambda x: (x[0] != ADMIN, x[0] != TESTER))  # сначала админ, потом тестер (второй аккаунт), потом остальные
