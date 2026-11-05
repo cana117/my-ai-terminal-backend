@@ -104,7 +104,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 BOT, ADMIN = E("BOT_TOKEN"), int(E("ADMIN_ID", "0") or 0)
-TESTER = int(E("TESTER_ID", "0") or 0)  # второй аккаунт админа (необязательно, только очередь рассылки; роль тестера будет в пункте 4)
+TESTER_ENV = {int(x) for x in re.split(r"[,\s]+", E("TESTER_ID", "")) if x.isdigit()}; TESTER = min(TESTER_ENV) if TESTER_ENV else 0  # второй аккаунт админа (необязательно, только очередь рассылки; роль тестера будет в пункте 4)
 TGAPI = E("TG_API", "https://api.telegram.org").rstrip("/")
 ADMIN_TOKEN, PKEY = E("ADMIN_TOKEN", ""), E("POLLINATIONS_KEY", "")
 DB, DATAVER = E("DB_PATH", "/tmp/data.db"), int(E("MC_DATA_VERSION", "4671"))
@@ -135,6 +135,7 @@ create table if not exists posts(id integer primary key autoincrement,at text,te
 create table if not exists seen(uid int,key text,primary key(uid,key));
 create table if not exists inv(name text primary key,qty int);
 create table if not exists settings(k text primary key,v text);
+create table if not exists ideas(id integer primary key autoincrement,uid int,at text,text text);
 create table if not exists accs(nick text primary key);
 create table if not exists logs(id integer primary key autoincrement,line text);
 create table if not exists ulogs(id integer primary key autoincrement,uid int,at text,what text);
@@ -153,9 +154,14 @@ def q(sql, *a):
     c = db.execute(sql, a); db.commit()
     if not sql.lstrip().lower().startswith("select") and "hist" not in sql and "logs" not in sql: dirty = True
     return c.fetchall()
-# --- служебные настройки (таблица settings). setv НЕ помечает базу "изменённой", чтобы служебные записи не вызывали бэкап ---
+# --- служебные настройки (таблица settings). Важные (тестеры, функции, модерация, тревога, модели) помечают базу изменённой и вызывают срочный бэкап через ~90 секунд ---
 def getv(k): r = db.execute("select v from settings where k=?", (k,)).fetchone(); return r[0] if r else None
-def setv(k, v): db.execute("insert or replace into settings values(?,?)", (k, str(v))); db.commit()
+URGENT_KEYS, KEEP_KEYS, URGENT = ("testers", "feat:", "mod_mode", "panic"), ("testers", "feat:", "mod_mode", "panic", "model:", "rpub_fp"), {"at": 0.0}
+def setv(k, v):
+    global dirty
+    db.execute("insert or replace into settings values(?,?)", (k, str(v))); db.commit()
+    if k.startswith(KEEP_KEYS): dirty = True
+    if k.startswith(URGENT_KEYS): URGENT["at"] = time.time()
 # --- Хранилище ключей, часть с базой (ядро шифрования см. в самом начале файла) ---
 def dek_for(owner, create=False, primary_only=False):
     """Личный ключ шифрования владельца (у каждого свой). Хранится в ukeys только в запертом виде."""
@@ -212,7 +218,7 @@ def note_usage(uid, model, u):
                    (dt.datetime.now(MSK).strftime("%F"), uid, model[:60], int(u.get("prompt_tokens") or 0), int(u.get("completion_tokens") or 0))); db.commit()
     except Exception as e: log.error("usage: %r", e)
 def testers():
-    s = {TESTER} if TESTER else set()
+    s = set(TESTER_ENV)
     try: s |= {int(x) for x in json.loads(getv("testers") or "[]")}
     except Exception: pass
     s.discard(ADMIN); return s
@@ -743,12 +749,13 @@ HELP_TOPICS = {
  "news": "Новости\n/news - свежее из источников прямо сейчас\n/sources - откуда берутся новости\n/subscribe on|off - ежедневная рассылка (по умолчанию выключена)\n/newstime 09:30 - когда присылать, по Москве (до 4 времён: /newstime 09:00 21:00)\n/newsformat ai|short - с кратким пересказом или только заголовки\n/removesource N - убрать свой источник\n/whatsnew - что нового в боте",
  "ai": "ИИ и ключи\nБот отвечает через твой ключ ИИ, так что лимитов от меня нет.\n/apikey add КЛЮЧ - подключить ключ (сообщение с ключом бот сразу удалит)\n/apikey providers - где взять бесплатный ключ (OpenRouter, Groq, Google и другие)\n/apikey list - твои ключи (скрыты); /apikey del N - удалить\n/model - выбрать модель; /models - список бесплатных моделей\n/mode coder|chat|auto - режим: для кода, обычный, сам выберет\n/link - связать с сайтом (общая история)",
  "files": "Файлы и картинки\nФото: пришли картинку с вопросом в подписи, разберу.\nФайл: пришли txt, md, csv, json или код (до 20 МБ), в подписи напиши, что сделать.\n/img описание - нарисовать картинку\n/export - выгрузить диалог файлом\nФайл с подписью /import - загрузить диалог (из бота, Claude, ChatGPT)\n/newchat - новый чат с сутью прошлого\n/clear - очистить диалог",
+ "ideas": "Идеи (для тестеров)\n/idea текст - предложить идею (до 500 символов), админ получит её сразу\n/ideas - посмотреть все идеи, чтобы не повторяться\nДальше пользуйся ботом как обычный человек и пиши, что неудобно или сломалось. Админ-данные (ключи, база, логи) тестеру не видны.",
  "other": "Прочее\n/start - меню; /rules - правила; /premium - скоро\n/whatsnew - что нового в боте\nСтарые названия команд тоже работают (/key, /sub, /time и другие).",
 }
 def help_kb(uid):
     rows = [[{"text": "Новости", "callback_data": "/help news"}, {"text": "ИИ и ключи", "callback_data": "/help ai"}],
             [{"text": "Файлы и картинки", "callback_data": "/help files"}, {"text": "Прочее", "callback_data": "/help other"}]]
-    return {"inline_keyboard": rows + ([[{"text": "Админ-панель", "callback_data": "/admin"}]] if uid == ADMIN else [])}
+    return {"inline_keyboard": rows + ([[{"text": "Идеи", "callback_data": "/help ideas"}]] if uid == ADMIN or is_tester(uid) else []) + ([[{"text": "Админ-панель", "callback_data": "/admin"}]] if uid == ADMIN else [])}
 HELP_ADMIN = "Админ-панель: /admin"
 ALIAS = {"/subscribe": "/sub", "/newstime": "/time", "/newsformat": "/format", "/removesource": "/delsource", "/apikey": "/key",
          "/mode": "/agent", "/whatsnew": "/updates", "/newchat": "/migrate_chat"}
@@ -757,7 +764,7 @@ def guess_key(k):
     for p_, name in KEY_HINTS:
         if k.startswith(p_): return k if name is None else f"{name}|{k}"
     return k
-ADMIN_SUBS = {"genkey", "rotate", "recovery", "strikes", "pardon", "mod", "tokens", "files", "export", "tester", "menu", "users", "ban", "unban", "viewkeys", "createcmd", "keypool", "status", "backup", "bots", "backups", "restore", "addkey", "logs", "broadcast", "health", "agents", "cachecl", "get_db", "get_config", "pushupdates", "feature"}
+ADMIN_SUBS = {"genkey", "rotate", "recovery", "strikes", "pardon", "mod", "tokens", "files", "export", "tester", "menu", "ideas", "idea", "check", "users", "ban", "unban", "viewkeys", "createcmd", "keypool", "status", "backup", "bots", "backups", "restore", "addkey", "logs", "broadcast", "health", "agents", "cachecl", "get_db", "get_config", "pushupdates", "feature"}
 MENU = {"inline_keyboard": [[{"text": "Новости", "callback_data": "/news"}, {"text": "Рассылка вкл", "callback_data": "/sub on"}],
                             [{"text": "Источники", "callback_data": "/sources"}, {"text": "Справка", "callback_data": "/help"}]]}
 def mask(k):
@@ -876,6 +883,33 @@ async def admin_upload(m, uid):
         await apply_db(blob); return await say(uid, "[OK] база заменена. Прежняя сохранена на сервере до перезапуска.")
     except ValueError as e: return await say(uid, f"[ОШИБКА] {e}\nНичего не изменено.")
 
+def ideas_text(n=30):
+    rows = q("select i.id,coalesce(u.name,i.uid),i.at,i.text from ideas i left join users u on u.id=i.uid order by i.id desc limit ?", n)
+    return ("Идеи (последние):\n" + "\n".join(f"№{i} {nm} ({at}): {tx}" for i, nm, at, tx in rows[::-1])) if rows else "Идей пока нет. Предложить: /idea текст"
+async def selfcheck():
+    ok = lambda b: "ОК" if b else "ПРОБЛЕМА"
+    try: tgok = bool((await tg("getMe")).get("ok"))
+    except Exception: tgok = False
+    try: dbok = db.execute("pragma integrity_check").fetchone()[0] == "ok"
+    except Exception: dbok = False
+    L = [f"Telegram: {ok(tgok)}", f"База: {ok(dbok)}, людей: {q('select count(*) from users')[0][0]}", f"Шифрование (ENC_KEY): {ok(bool(VAULT))}"]
+    tok, _ = bk_target()
+    if tok:
+        try: bok = bool((await tg("getMe", tok)).get("ok"))
+        except Exception: bok = False
+        lb = float(getv("last_backup") or 0)
+        L.append(f"Бот бэкапов: {ok(bok)}, последний бэкап: " + (dt.datetime.fromtimestamp(lb, MSK).strftime("%d.%m %H:%M") if lb else "ещё не было"))
+    else: L.append("Бот бэкапов: не привязан")
+    L += [f"Бесплатных моделей: {len(FREE)}" + ("" if FREE else " (список ещё грузится)"), "Тестеры: " + (", ".join(map(str, sorted(testers()))) or "нет")]
+    return f"Запуск v{VERSION}: " + ("всё работает" if tgok and dbok and VAULT else "есть проблемы") + "\n" + "\n".join(L)
+async def startup_report(rs):
+    await asyncio.sleep(8); await say(ADMIN, await selfcheck() + f"\nБаза при запуске: {rs}")
+TEST_CMDS = [("idea", "Предложить идею"), ("ideas", "Список идей")]
+async def set_menu_for(uid, on):
+    try:
+        if on: await tg("setMyCommands", json={"commands": [{"command": c, "description": d} for c, d in PUB_CMDS + TEST_CMDS], "scope": {"type": "chat", "chat_id": uid}})
+        else: await tg("deleteMyCommands", json={"scope": {"type": "chat", "chat_id": uid}})
+    except Exception as e: log.error("menu: %r", e)
 def status_text():
     up = int(time.time() - T0)
     return ("Статус\n" f"Версия: v{VERSION}\nРаботает: {up // 3600} ч {up % 3600 // 60} мин\n"
@@ -885,13 +919,13 @@ def status_text():
             f"Тревога: {'ВКЛ' if panic() else 'выкл'}\nТестеры: {', '.join(map(str, sorted(testers()))) or 'нет'}\n"
             f"Последняя ошибка: {STAT['err'][:80] or 'нет'}")
 ADM_SECT = {
- "users": ("Пользователи", "/admin users - список\n/admin ban ID, /admin unban ID - закрыть или открыть доступ\n/admin tester - тестеры; /admin tester add ID, /admin tester del ID\n/admin logs [N] - последние действия людей; /admin logs sys [N] - технические логи\n/admin strikes [ID], /admin pardon ID - нарушения и прощение\n/admin mod ai|local|off - автомодерация"),
+ "users": ("Пользователи", "/admin users - список\n/admin ban ID, /admin unban ID - закрыть или открыть доступ\n/admin tester - тестеры; /admin tester add ID, /admin tester del ID\n/admin logs [N] - последние действия людей; /admin logs sys [N] - технические логи\n/admin strikes [ID], /admin pardon ID - нарушения и прощение\n/admin mod ai|local|off - автомодерация\n/admin ideas - идеи тестеров; /admin idea del N - удалить идею"),
  "news": ("Новости и посты", "/post текст - всем сразу; /post 18:30 текст; /post 05.11 18:30 текст\n/posts - запланированные, /delpost N - убрать\n/addsource ссылка - источник только тебе; /addsource all ссылка - общий\n/admin pushupdates - разослать «Что нового»\n/admin broadcast текст - срочное сообщение всем"),
  "ai": ("ИИ, ключи, модели", "/admin agents - какие модели в работе\n/admin keypool - общий пул ключей; /admin addkey КЛЮЧ - добавить; /admin viewkeys - ключи в масках\n/admin tokens - расход токенов\n/admin cachecl - очистить кэш\n/admin feature files|img|ctx on|off - функции для всех"),
  "data": ("База и бэкапы", "/admin backup - копия сейчас; /admin backups - список; /admin restore yes - восстановить\n/admin bots - проверка ботов; /setbackup ТОКЕН - привязать бота бэкапов\n/admin get_db, /admin get_config, /admin export - выгрузки\n/admin files - индекс данных"),
  "safe": ("Безопасность", "/panic on|keys|off - тревожная кнопка\n/admin genkey - новая случайная строка\n/admin rotate - обновить шифрование после смены ENC_KEY\n/admin recovery - состояние аварийного ключа\n/admin health - проверка сервиса"),
  "games": ("PS99 и Minecraft", "/news ps99 - топ по RAP\n/price имя - цены всех вариантов\n/acc add НикRoblox, /acc del Ник, /acc - аккаунты PS99\n/inv - инвентарь с RAP\n/new - что нового в игре\n/mc описание - схема .schem\n/nick имя1 имя2 - свободны ли ники Minecraft"),
- "sys": ("Система", "/admin status - состояние\n/admin health - проверка сервиса\n/admin createcmd имя текст - своя команда"),
+ "sys": ("Система", "/admin status - состояние\n/admin health - проверка сервиса\n/admin createcmd имя текст - своя команда\n/admin check - проверка запуска (всё ли работает)"),
 }
 ADM_KB = {"inline_keyboard": [[{"text": "Пользователи", "callback_data": "/admin menu users"}, {"text": "Новости и посты", "callback_data": "/admin menu news"}],
                               [{"text": "ИИ и ключи", "callback_data": "/admin menu ai"}, {"text": "База и бэкапы", "callback_data": "/admin menu data"}],
@@ -921,12 +955,15 @@ async def admin(sub, arg):
                 if len(lst) >= 3: return "Не больше 3 тестеров. Убери лишнего: /admin tester del ID"
                 lst.add(n_)
             else:
-                if n_ == TESTER: return "Этот тестер задан в Render (TESTER_ID), убери его там"
+                if n_ in TESTER_ENV: return "Этот тестер задан в Render (TESTER_ID), убери его там"
                 lst.discard(n_)
-            setv("testers", json.dumps(sorted(lst)))
+            setv("testers", json.dumps(sorted(lst))); asyncio.create_task(set_menu_for(n_, w[0] == "add"))
         return ("Тестеры: " + (", ".join(map(str, sorted(testers()))) or "нет") + "\nТестер: не админ, не банится, лимиты и модерация как у обычного человека, админ-данных не видит.\n"
-                "Добавить: /admin tester add ID. Убрать: /admin tester del ID")
+                "Добавить: /admin tester add ID. Убрать: /admin tester del ID\nСохраняется в бэкап в течение пары минут. Чтобы пережило любой сбой, впиши ID и в Render: TESTER_ID (несколько через запятую).")
     if sub == "menu": return admin_section(arg.strip().lower())
+    if sub == "check": return await selfcheck()
+    if sub == "ideas": return ideas_text(int(arg) if arg.isdigit() else 30)
+    if sub == "idea" and arg.startswith("del ") and arg[4:].strip().isdigit(): q("delete from ideas where id=?", int(arg[4:])); return "Идея удалена"
     if sub == "tokens": return tokens_summary()
     if sub == "genkey": return "Случайная строка (для ADMIN_TOKEN и т.п.):\n" + base64.urlsafe_b64encode(os.urandom(32)).decode() + "\nСообщение останется в истории Telegram, удали его после копирования. Для ENC_KEY надёжнее генерировать на своём компьютере: python app.py genkey"
     if sub == "rotate":
@@ -1379,6 +1416,7 @@ async def handle(m):
         return await r("Привет! Выбери действие или просто напиши вопрос:", reply_markup=mk)
     if cmd == "/help":
         tp = arg.lower().split()[0] if arg else ""
+        if tp == "ideas" and not (uid == ADMIN or is_tester(uid)): tp = ""
         if tp == "admin" and uid == ADMIN: return await r(admin_section(""), reply_markup=ADM_KB)
         return await r(HELP_TOPICS.get(tp, HELP), reply_markup=help_kb(uid))
     if cmd == "/clear": q("delete from hist where sid=?", sid); return await r("[OK] чат очищен")
@@ -1504,6 +1542,15 @@ async def handle(m):
     if cmd == "/migrate_chat":
         s = " | ".join(x["content"][:150] for x in hist_load_tail(sid)) or "пусто"
         q("delete from hist where sid=?", sid); hadd(sid, "user", "Контекст из прошлого чата: " + s); return await r("[MIGRATED] " + s)
+    if cmd in ("/idea", "/ideas") and (uid == ADMIN or is_tester(uid)):
+        if cmd == "/ideas" or not arg: return await r(ideas_text() + ("" if cmd == "/ideas" else "\nПредложить: /idea текст"))
+        if len(arg) > 500: return await r("Идея длинновата, уложись в 500 символов.")
+        if q("select count(*) from ideas where uid=? and at>=?", uid, (dt.datetime.now(MSK) - dt.timedelta(days=1)).strftime("%F %H:%M"))[0][0] >= 20: return await r("Сегодня уже 20 идей, продолжим завтра.")
+        blk = await screen(uid, arg)
+        if blk: return await r(blk)
+        q("insert into ideas(uid,at,text) values(?,?,?)", uid, dt.datetime.now(MSK).strftime("%F %H:%M"), arg); n_ = q("select max(id) from ideas")[0][0]
+        if uid != ADMIN: await say(ADMIN, f"Новая идея №{n_} от {(q('select name from users where id=?', uid) or [(uid,)])[0][0]} ({uid}):\n{arg}")
+        return await r(f"Записал идею №{n_}. Спасибо!")
     if cmd == "/models":
         free = list(FREE)[:25]
         return await r("Бесплатные модели OpenRouter. Выбрать можно после подключения ключа: /apikey add КЛЮЧ, потом /model.\n" + ("\n".join(f"{i}. {x}" for i, x in enumerate(free, 1)) or "Список пока не загрузился, попробуй через минуту.") + "\n\nДругие провайдеры: /apikey providers")
@@ -1668,11 +1715,11 @@ async def send_backup(token, chat, snap, new_gen):
     await tg("pinChatMessage", token, json={"chat_id": chat, "message_id": mid, "disable_notification": True})
     for a, _, _ in drop: await tg("deleteMessage", token, json={"chat_id": chat, "message_id": int(a)})
     last_bk[token] = [(mid, fid, now)] + keep
-async def job_backup(_=None, force=False):
+async def job_backup(_=None, force=False, urgent=False):
     global dirty
     tok, chat = bk_target()
     if not tok: return "бот бэкапов не привязан. Добавь BACKUP_BOT_TOKEN в Render или напиши /setbackup ТОКЕН" if force else None
-    if not force and (not dirty or time.time() - float(getv("last_backup") or 0) < bk_interval()[0]): return
+    if not force and (not dirty or (not urgent and time.time() - float(getv("last_backup") or 0) < bk_interval()[0])): return
     if not q("select count(*) from users")[0][0]: return "база пустая, бэкап пропущен (чтобы не затереть хорошие копии)"
     STAT["cut"] = 0; flush_logs(); prev = getv("last_backup"); setv("last_backup", int(time.time())); dirty = False; snap = "/tmp/snap.db"
     try:
@@ -1725,6 +1772,7 @@ async def sched():
                         ("mod-" + n.strftime("%F-") + str(n.hour // 6), True), ("ping-" + n.strftime("%F-%H-") + str(n.minute // 5), True)):
             if ok and tag not in done:
                 done.add(tag); asyncio.create_task(JOBS[tag.split("-")[0]](n.strftime("%H:%M")))
+        if URGENT["at"] and time.time() - URGENT["at"] > 90: URGENT["at"] = 0; asyncio.create_task(job_backup(None, urgent=True))
         flush_logs(); asyncio.create_task(job_posts())
         if len(done) > 500: done.clear()
         await asyncio.sleep(30)
@@ -1744,7 +1792,7 @@ async def start():
     asyncio.create_task(refresh_models()); asyncio.create_task(sched())
     if BOT: asyncio.create_task(set_menu())
     if BOT:
-        asyncio.create_task(poll()); asyncio.create_task(say(ADMIN, f"Сервис перезапущен (v{VERSION}). База: {rs}."))
+        asyncio.create_task(poll()); asyncio.create_task(startup_report(rs))
 PUB_CMDS = [("start", "Меню"), ("help", "Помощь по темам"), ("news", "Новости сейчас"), ("subscribe", "Рассылка вкл/выкл"), ("newstime", "Время рассылки"),
             ("newsformat", "Формат новостей"), ("sources", "Откуда новости"), ("removesource", "Убрать свой источник"), ("apikey", "Свой ключ ИИ"),
             ("model", "Выбор модели"), ("models", "Список бесплатных моделей"), ("mode", "Режим ИИ"), ("img", "Нарисовать картинку"), ("export", "Выгрузить диалог"),
