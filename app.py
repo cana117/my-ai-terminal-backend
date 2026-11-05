@@ -5,6 +5,11 @@ import sys, tempfile
 # DEK запирается мастер-ключом (dek_m) и, если задан RECOVERY_PUB, ещё и аварийным открытым ключом (dek_r). Закрытая половина аварийной пары есть только у тебя.
 # Бэкап шифруется своим случайным ключом, который тоже запирается и мастер-ключом, и аварийным. Шифр везде AES-256-GCM, привязка к владельцу через AAD.
 # python app.py genkey | genrecovery | decrypt <enc2:..|файл> [ID] | recover <файл> [ID]  (последнее: RECOVERY_KEY=закрытый_ключ)
+try: import cryptography  # если Render не поставил библиотеку из requirements.txt, ставим сами (фиксированная команда, без внешнего ввода)
+except Exception:
+    try:
+        import subprocess; subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "cryptography", "tzdata"], timeout=400, check=False)
+    except Exception: pass
 try:
     from cryptography.fernet import Fernet
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
