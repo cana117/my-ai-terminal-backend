@@ -1719,7 +1719,11 @@ async def job_backup(_=None, force=False, urgent=False):
     global dirty
     tok, chat = bk_target()
     if not tok: return "бот бэкапов не привязан. Добавь BACKUP_BOT_TOKEN в Render или напиши /setbackup ТОКЕН" if force else None
-    if not force and (not dirty or (not urgent and time.time() - float(getv("last_backup") or 0) < bk_interval()[0])): return
+    if not force:
+        since = time.time() - float(getv("last_backup") or 0)
+        if urgent:
+            if not dirty: return
+        elif not ((dt.datetime.now(MSK).hour == 0 and since > 20 * 3600) or since > 26 * 3600): return  # плановый бэкап раз в сутки в 00:00 МСК (если проспали, то при пробуждении)
     if not q("select count(*) from users")[0][0]: return "база пустая, бэкап пропущен (чтобы не затереть хорошие копии)"
     STAT["cut"] = 0; flush_logs(); prev = getv("last_backup"); setv("last_backup", int(time.time())); dirty = False; snap = "/tmp/snap.db"
     try:
