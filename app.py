@@ -892,7 +892,7 @@ async def selfcheck():
     except Exception: tgok = False
     try: dbok = db.execute("pragma integrity_check").fetchone()[0] == "ok"
     except Exception: dbok = False
-    L = [f"Telegram: {ok(tgok)}", f"База: {ok(dbok)}, людей: {q('select count(*) from users')[0][0]}", f"Шифрование (ENC_KEY): {ok(bool(VAULT))}"]
+    L = [f"Telegram: {ok(tgok)}", f"База: {ok(dbok)}, людей: {q('select count(*) from users')[0][0]}", f"Шифрование (ENC_KEY): {ok(bool(VAULT))}" + ("" if VAULT else (" - в Render нет переменной ENC_KEY (Environment)" if AESGCM else " - не установлена библиотека cryptography: в requirements.txt нужна строка cryptography"))]
     tok, _ = bk_target()
     if tok:
         try: bok = bool((await tg("getMe", tok)).get("ok"))
