@@ -33,7 +33,8 @@ button:focus-visible,input:focus-visible{outline:1px solid var(--acc)}
 const $=s=>document.querySelector(s);
 const H={"01-01":"С Новым годом","02-23":"С Днём защитника Отечества","03-08":"С 8 марта","05-01":"С Праздником Весны и Труда","05-09":"С Днём Победы","06-12":"С Днём России","11-04":"С Днём народного единства","12-31":"С наступающим Новым годом"};
 const API='';/* если сайт на HF, а бэкенд на Render: https://xxx.onrender.com */
-let CID=localStorage.getItem('cid');if(!CID){CID=Math.random().toString(36).slice(2,12);try{localStorage.setItem('cid',CID)}catch(e){}}
+let CID='';try{CID=localStorage.getItem('cid')||''}catch(e){}
+if(CID.length<32){CID=Array.from(crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join('');try{localStorage.setItem('cid',CID)}catch(e){}}
 let S={},cur;
 try{S=JSON.parse(localStorage.getItem('chats')||'{}')}catch(e){}
 const save=()=>{try{localStorage.setItem('chats',JSON.stringify(S))}catch(e){}};
@@ -57,7 +58,7 @@ async function send(ev){
   try{
     const r=await fetch(API+(v.startsWith('/link ')?'/api/link':'/api/chat'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cid:CID,chat:cur,text:v,code:v.slice(6).trim()})});
     c.m.push({role:'assistant',content:(await r.json()).reply});
-  }catch(e){c.m.push({role:'assistant',content:'[CONN ERROR]: бэкенд недоступен'})}
+  }catch(e){c.m.push({role:'assistant',content:'Ошибка соединения: сервис недоступен, попробуй через минуту'})}
   save();draw();
 }
 if(!Object.keys(S).length)neu();else{cur=Object.keys(S).pop();draw()}

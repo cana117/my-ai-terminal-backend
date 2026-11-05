@@ -4,7 +4,7 @@ import sys, tempfile
 # Мастер-ключ ENC_KEY (в Render) НЕ шифрует ключи людей напрямую. У каждого владельца есть свой случайный ключ шифрования (DEK, таблица ukeys),
 # DEK запирается мастер-ключом (dek_m) и, если задан RECOVERY_PUB, ещё и аварийным открытым ключом (dek_r). Закрытая половина аварийной пары есть только у тебя.
 # Бэкап шифруется своим случайным ключом, который тоже запирается и мастер-ключом, и аварийным. Шифр везде AES-256-GCM, привязка к владельцу через AAD.
-# python app.py genkey | genrecovery | decrypt <enc2:..|файл> [ID] | recover <файл> [ID]  (последнее: RECOVERY_KEY=закрытый_ключ)
+# python app.py genkey | genrecovery | decrypt <enc2:..|файл> ID: | recover <файл> ID:  (последнее: RECOVERY_KEY=закрытый_ключ)
 try: import cryptography  # если Render не поставил библиотеку из requirements.txt, ставим сами (фиксированная команда, без внешнего ввода)
 except Exception:
     try:
@@ -239,7 +239,7 @@ FREE, VISION = [], []
 SYS = {
     "chat": "Ты MY_AI, ассистент в Telegram и на сайте. Стиль: лаконичный и понятный, без префиксов вроде [MY_AI] в начале ответа. "
             "Отвечай на языке пользователя, коротко и по делу. Не предлагай взлом, обход защиты и подобное. "
-            "Если приходится остановиться из-за лимита, выдай отчёт: [COMPLETED], [FILE GENERATED], [LIMIT REACHED PREEMPTIVELY], [NEXT STEPS].",
+            "Если приходится остановиться из-за лимита, выдай отчёт: Готово: , Файл готов: , [LIMIT REACHED PREEMPTIVELY], Дальше: .",
     "vision": "Ты MY_AI. Тебе присылают изображения. Опиши и разбери то, что видишь, по запросу пользователя. Отвечай на его языке, коротко и по делу.",
     "coder": "Ты Агент-Кодер: пишешь и дорабатываешь код, отвечаешь кратко, код в блоках. Без воды.",
     "optimizer": "Ты Агент-Оптимизатор: сжимаешь текст без потери фактов, максимально коротко.",
@@ -459,8 +459,8 @@ async def mc(uid, desc):
     if raw.startswith("[RATE LIMIT"): return raw, None
     try:
         m = re.search(r"\{.*\}", raw, re.S); blob, n, p = build_schem(json.loads(m.group(0)))
-        return f"[MC OK] блоков: {n}, типов: {p}. Вставка: //schem load, //paste", blob
-    except Exception as e: return f"[MC ERROR] модель вернула негодную схему ({e}). Повтори запрос.", None
+        return f"Схема готова: блоков: {n}, типов: {p}. Вставка: //schem load, //paste", blob
+    except Exception as e: return f"Ошибка схемы: модель вернула негодную схему ({e}). Повтори запрос.", None
 
 # ---------- PS99 ----------
 rap_prev = {}
@@ -489,7 +489,7 @@ async def inv_report(nick):
         v = (d["data"].get("views") or {}).get("inventory") or {}
         if not v.get("available"): return f"[{nick}] инвентарь скрыт ({v.get('reason', '?')}). Открой его в настройках на db.biggames.io.", None
         items = v["data"]["items"]
-    except Exception as e: return f"[{nick}] [ERROR] {e!r}", None
+    except Exception as e: return f"[{nick}] Ошибка: {e!r}", None
     rows = sorted(((i.get("displayName") or i.get("id"), i.get("variant"), i.get("count", 1), (i.get("rap") or 0) * (i.get("count") or 1)) for i in items), key=lambda x: -x[3])
     tot = sum(x[3] for x in rows)
     return f"[{nick}] RAP: {short(tot)}, предметов: {len(items)}\n" + "\n".join(f"{n}{' ' + vr if vr else ''} x{c}: {short(val)}" for n, vr, c, val in rows[:12]), tot
@@ -511,7 +511,7 @@ async def ps99_watch():
         old = q("select v from settings where k=?", "invtot:" + n)
         if not old or old[0][0] != str(tot):
             q("insert or replace into settings values(?,?)", "invtot:" + n, str(tot))
-            if old and float(old[0][0]) > 0 and abs(tot - float(old[0][0])) / float(old[0][0]) > 0.02: await say(ADMIN, f"[INV] {n}: {short(int(float(old[0][0])))} -> {short(tot)}")
+            if old and float(old[0][0]) > 0 and abs(tot - float(old[0][0])) / float(old[0][0]) > 0.02: await say(ADMIN, f"Инвентарь: {n}: {short(int(float(old[0][0])))} -> {short(tot)}")
     if dt.datetime.now(MSK).hour % 3 == 0: await ps99_new()
 async def ps99_movers():
     global rap_prev
@@ -524,7 +524,7 @@ async def ps99_movers():
 async def digest():
     async with httpx.AsyncClient(timeout=30) as c:
         try: xml = (await c.get(E("NEWS_RSS", "https://lenta.ru/rss/news"))).text
-        except Exception: return "[NEWS ERROR] лента недоступна"
+        except Exception: return "Ошибка новостей: лента недоступна"
     t = re.findall(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", xml)[1:9]
     return await llm([{"role": "user", "content": "Сделай короткую сводку:\n" + "\n".join(t)}], "optimizer")
 VERSION = "0.01"  # Alpha. Дальше микро-шаги: 0.02, 0.03... крупные обновления: 0.1, 0.2... юбилейные: 1.0
@@ -657,7 +657,7 @@ async def send_digest(uid, fmt, slot):
         items = await collect(uid, True)
         if not items: return
         text, keys = await make_digest(items, fmt)
-        await say(uid, "[NEWS]\n" + text, disable_web_page_preview=True)
+        await say(uid, "Новости: \n" + text, disable_web_page_preview=True)
         for k in keys: q("insert or ignore into seen values(?,?)", uid, k)
     except Exception as e: log.error("digest %s: %r", uid, e)
 dg_lock = asyncio.Lock()
@@ -755,13 +755,20 @@ HELP_TOPICS = {
  "ai": "ИИ и ключи\nБот отвечает через твой ключ ИИ, так что лимитов от меня нет.\n/apikey add КЛЮЧ - подключить ключ (сообщение с ключом бот сразу удалит)\n/apikey providers - где взять бесплатный ключ (OpenRouter, Groq, Google и другие)\n/apikey list - твои ключи (скрыты); /apikey del N - удалить\n/model - выбрать модель; /models - список бесплатных моделей\n/mode coder|chat|auto - режим: для кода, обычный, сам выберет\n/link - связать с сайтом (общая история)",
  "files": "Файлы и картинки\nФото: пришли картинку с вопросом в подписи, разберу.\nФайл: пришли txt, md, csv, json или код (до 20 МБ), в подписи напиши, что сделать.\n/img описание - нарисовать картинку\n/export - выгрузить диалог файлом\nФайл с подписью /import - загрузить диалог (из бота, Claude, ChatGPT)\n/newchat - новый чат с сутью прошлого\n/clear - очистить диалог",
  "ideas": "Идеи (для тестеров)\n/idea текст - предложить идею (до 500 символов), админ получит её сразу\n/ideas - посмотреть все идеи, чтобы не повторяться\nДальше пользуйся ботом как обычный человек и пиши, что неудобно или сломалось. Админ-данные (ключи, база, логи) тестеру не видны.",
- "other": "Прочее\n/start - меню; /rules - правила; /premium - скоро\n/whatsnew - что нового в боте\nСтарые названия команд тоже работают (/key, /sub, /time и другие).",
+ "other": "Прочее\n/start и /help - список команд; /menu - меню по темам; /rules - правила; /premium - скоро\n/whatsnew - что нового в боте\nСтарые названия команд тоже работают (/key, /sub, /time и другие).",
 }
 def help_kb(uid):
     rows = [[{"text": "Новости", "callback_data": "/help news"}, {"text": "ИИ и ключи", "callback_data": "/help ai"}],
             [{"text": "Файлы и картинки", "callback_data": "/help files"}, {"text": "Прочее", "callback_data": "/help other"}]]
     return {"inline_keyboard": rows + ([[{"text": "Идеи", "callback_data": "/help ideas"}]] if uid == ADMIN or is_tester(uid) else []) + ([[{"text": "Админ-панель", "callback_data": "/admin"}]] if uid == ADMIN else [])}
 HELP_ADMIN = "Админ-панель: /admin"
+USAGE = {"subscribe": "on|off", "newstime": "09:30", "newsformat": "ai|short", "removesource": "N", "apikey": "add КЛЮЧ", "model": "N|auto", "mode": "coder|chat|auto", "img": "описание", "idea": "текст"}
+def cmds_text(uid):
+    rows = list(PUB_CMDS) + (list(TEST_CMDS) if (uid == ADMIN or is_tester(uid)) else [])
+    f = lambda L: "\n".join(f"/{c}" + (" " + USAGE[c] if c in USAGE else "") + f" - {d}" for c, d in L)
+    out = "Команды, которые тебе доступны:\n" + f(rows)
+    if uid == ADMIN: out += "\n\nТолько у админа:\n" + f(ADM_CMDS) + "\n/admin tester add ID - добавить тестера (убрать: /admin tester del ID)"
+    return out + "\n\n/menu - меню по темам, /help ТЕМА (news, ai, files, other) - подробнее."
 ALIAS = {"/subscribe": "/sub", "/newstime": "/time", "/newsformat": "/format", "/removesource": "/delsource", "/apikey": "/key",
          "/mode": "/agent", "/whatsnew": "/updates", "/newchat": "/migrate_chat"}
 KEY_HINTS = (("sk-or-", None), ("gsk_", "groq"), ("AIza", "google"), ("csk-", "cerebras"), ("nvapi-", "nvidia"), ("github_pat_", "github"), ("ghp_", "github"), ("hf_", "huggingface"))
@@ -870,7 +877,7 @@ def export_zip():
 async def send_admin_file(uid, sub):
     if sub == "get_db":
         flush_logs(); dst = sqlite3.connect("/tmp/export.db"); db.backup(dst); dst.execute("update keys set key='скрыт-'||rowid"); dst.execute("delete from ukeys"); dst.commit(); dst.close(); blob = open("/tmp/export.db", "rb").read()
-        if len(blob) > 49_000_000: return await say(uid, "[ERROR] база больше 50 МБ, Telegram не даёт боту прислать такой файл")
+        if len(blob) > 49_000_000: return await say(uid, "Ошибка: база больше 50 МБ, Telegram не даёт боту прислать такой файл")
         return await tg("sendDocument", data={"chat_id": uid, "caption": "База бота (SQLite). Ключи в файле скрыты, при возврате файла текущие ключи сохраняются. Вернуть правки: отправь файл обратно с подписью /admin set_db yes"},
                         files={"document": ("data.db", blob)})
     if sub == "export": return await tg("sendDocument", data={"chat_id": uid, "caption": "Файлы данных без ключей (users, blacklist, vip, tokens, index)."}, files={"document": ("data_export.zip", export_zip())})
@@ -879,13 +886,13 @@ async def send_admin_file(uid, sub):
 async def admin_upload(m, uid):
     d = m["document"]; name = (d.get("file_name") or "").lower(); cap = (m.get("caption") or "").lower().split()
     if not name.endswith((".json", ".db")): return await say(uid, "Принимаю только config.json (настройки) или .db (база).")
-    if d.get("file_size", 0) > 20_000_000: return await say(uid, "[ERROR] файл больше 20 МБ, Telegram не даёт боту его скачать")
+    if d.get("file_size", 0) > 20_000_000: return await say(uid, "Ошибка: файл больше 20 МБ, Telegram не даёт боту его скачать")
     if name.endswith(".db") and "yes" not in cap: return await say(uid, "Это заменит ВСЮ базу бота. Чтобы подтвердить, отправь файл ещё раз с подписью: /admin set_db yes")
     blob, why = await busy(uid, tg_download(d["file_id"], 20_000_000))
-    if blob is None: return await say(uid, "[ERROR] не смог скачать файл")
+    if blob is None: return await say(uid, "Ошибка: не смог скачать файл")
     try:
-        if name.endswith(".json"): return await say(uid, "[OK] настройки применены:\n" + apply_config(json.loads(blob.decode("utf-8-sig"))))
-        await apply_db(blob); return await say(uid, "[OK] база заменена. Прежняя сохранена на сервере до перезапуска.")
+        if name.endswith(".json"): return await say(uid, "настройки применены:\n" + apply_config(json.loads(blob.decode("utf-8-sig"))))
+        await apply_db(blob); return await say(uid, "база заменена. Прежняя сохранена на сервере до перезапуска.")
     except ValueError as e: return await say(uid, f"[ОШИБКА] {e}\nНичего не изменено.")
 
 def ideas_text(n=30):
@@ -924,7 +931,7 @@ def status_text():
             f"Тревога: {'ВКЛ' if panic() else 'выкл'}\nТестеры: {', '.join(map(str, sorted(testers()))) or 'нет'}\n"
             f"Последняя ошибка: {STAT['err'][:80] or 'нет'}")
 ADM_SECT = {
- "users": ("Пользователи", "/admin users - список\n/admin ban ID, /admin unban ID - закрыть или открыть доступ\n/admin tester - тестеры; /admin tester add ID, /admin tester del ID\n/admin logs [N] - последние действия людей; /admin logs sys [N] - технические логи\n/admin strikes [ID], /admin pardon ID - нарушения и прощение\n/admin mod ai|local|off - автомодерация\n/admin ideas - идеи тестеров; /admin idea del N - удалить идею"),
+ "users": ("Пользователи", "/admin users - список\n/admin ban ID, /admin unban ID - закрыть или открыть доступ\n/admin tester - тестеры; /admin tester add ID, /admin tester del ID\n/admin logs [N] - последние действия людей; /admin logs sys [N] - технические логи\n/admin strikes ID: , /admin pardon ID - нарушения и прощение\n/admin mod ai|local|off - автомодерация\n/admin ideas - идеи тестеров; /admin idea del N - удалить идею"),
  "news": ("Новости и посты", "/post текст - всем сразу; /post 18:30 текст; /post 05.11 18:30 текст\n/posts - запланированные, /delpost N - убрать\n/addsource ссылка - источник только тебе; /addsource all ссылка - общий\n/admin pushupdates - разослать «Что нового»\n/admin broadcast текст - срочное сообщение всем"),
  "ai": ("ИИ, ключи, модели", "/admin agents - какие модели в работе\n/admin keypool - общий пул ключей; /admin addkey КЛЮЧ - добавить; /admin viewkeys - ключи в масках\n/admin tokens - расход токенов\n/admin cachecl - очистить кэш\n/admin feature files|img|ctx on|off - функции для всех"),
  "data": ("База и бэкапы", "/admin backup - копия сейчас; /admin backups - список; /admin restore yes - восстановить\n/admin bots - проверка ботов; /setbackup ТОКЕН - привязать бота бэкапов\n/admin get_db, /admin get_config, /admin export - выгрузки\n/admin files - индекс данных"),
@@ -985,16 +992,16 @@ async def admin(sub, arg):
         q("delete from strikes where uid=?", int(arg)); q("update users set banned=0 where id=?", int(arg)); setv(f"shadow:{arg}", 0); return f"Нарушения {arg} сброшены, доступ открыт"
     if sub == "files": return json.dumps(files_index(), ensure_ascii=False, indent=1)
     if sub == "addkey" and arg:
-        if not VAULT: return "[ERROR] в Render нет ENC_KEY, ключ не сохранён"
+        if not VAULT: return "Ошибка: в Render нет ENC_KEY, ключ не сохранён"
         if any(dec(v, 0) == arg.strip() for (v,) in q("select key from keys where owner=0")): return "такой ключ уже есть"
         try: q("insert into keys values(0,?)", enc(arg.strip(), 0))
-        except ValueError as e: return f"[ERROR] {e}"
-        return "[OK] ключ в общем пуле (его видят только админ и системные задачи)"
+        except ValueError as e: return f"Ошибка: {e}"
+        return "ключ в общем пуле (его видят только админ и системные задачи)"
     if sub == "viewkeys": return "\n".join(f"{o}: {mask(dec(k, o))}" for o, k in q("select owner,key from keys")) or "пусто (env-ключи не показываются)"
     if sub == "keypool":
         now = time.time(); ks = keys_for(-1)
         return f"пул: {len(ks)}\n" + "\n".join(f"{mask(k)} {'cooldown %dс' % (cool[k] - now) if cool.get(k, 0) > now else 'OK'}" for k in ks)
-    if sub == "createcmd" and " " in arg: n, _, t = arg.partition(" "); q("insert or replace into cmds values(?,?)", n.lstrip("/").lower(), t); return "[OK] /" + n.lstrip("/")
+    if sub == "createcmd" and " " in arg: n, _, t = arg.partition(" "); q("insert or replace into cmds values(?,?)", n.lstrip("/").lower(), t); return "/" + n.lstrip("/")
     if sub == "logs":
         p = arg.split()
         if p and p[0] == "sys":
@@ -1003,8 +1010,8 @@ async def admin(sub, arg):
     if sub in ("get_db", "get_config", "export"): return "Эта команда работает только в Telegram: файл приходит в чат."
     if sub == "backup":
         err = await job_backup(force=True)
-        if err: return f"[BACKUP ERROR] {err}"
-        return "[OK] бэкап отправлен в бота-сейвера" + (f" (файл слишком большой: {STAT['cut']} самых новых пользователей уйдут в следующий бэкап)" if STAT["cut"] else "")
+        if err: return f"🚨 Ошибка бэкапа: {err}"
+        return "бэкап отправлен в бота-сейвера" + (f" (файл слишком большой: {STAT['cut']} самых новых пользователей уйдут в следующий бэкап)" if STAT["cut"] else "")
     if sub == "backups":
         c = await bk_scan(); iv, surge, n24 = bk_interval(); last = float(getv("last_backup") or 0)
         head = (f"Режим: {'наплыв' if surge else 'обычный'}, новых за 24 ч: {n24}. Бэкап не чаще чем раз в {iv / 3600:.0f} ч. "
@@ -1012,7 +1019,7 @@ async def admin(sub, arg):
         return head + "\n" + ("\n".join(f"{i}. {l}" for i, (_, _, _, l) in enumerate(c, 1)) or "бэкапов нет")
     if sub == "restore":
         if arg != "yes": return "Заменит текущую базу самой свежей рабочей копией. Подтверди: /admin restore yes"
-        return "[RESTORE] " + await restore(force=True)
+        return "Восстановление: " + await restore(force=True)
     if sub == "bots":
         async def chk(t):
             try: me = await tg("getMe", t); return "@" + me["result"]["username"] if me.get("ok") else "токен НЕ РАБОТАЕТ"
@@ -1020,23 +1027,23 @@ async def admin(sub, arg):
         t, c = bk_target()
         return ("Чат-бот: " + (await chk(BOT) if BOT else "BOT_TOKEN не задан") + "\nБот бэкапов: "
                 + ("НЕ ПРИВЯЗАН, автобэкапы выключены. /setbackup ТОКЕН" if not t else await chk(t) + f" (чат {c})") + "\nБаза: " + ("есть изменения" if dirty else "бэкап свежий"))
-    if sub == "cachecl": cache.clear(); return "[OK] кэш очищен"
+    if sub == "cachecl": cache.clear(); return "кэш очищен"
     if sub == "agents": return "\n".join(f"{r}: {', '.join(models_for(r)) or 'нет free-моделей -> Pollinations'}" for r in ("coder", "optimizer", "chat"))
     if sub in ("pushupdates", "broadcast") and panic(): return "[ТРЕВОГА] рассылки остановлены. /panic off - выключить режим"
     if sub == "pushupdates":
         n = 0
         for (i,) in q("select id from users where banned=0"):
-            try: await say(i, f"[UPDATE] v{VERSION}\n" + CHANGELOG[0]); n += 1
+            try: await say(i, f"Обновление: v{VERSION}\n" + CHANGELOG[0]); n += 1
             except Exception: pass
             await asyncio.sleep(0.05)
-        return f"[UPDATE] разослано {n}"
+        return f"Обновление: разослано {n}"
     if sub == "broadcast" and arg:
         n = 0
         for (i,) in q("select id from users where banned=0"):
-            try: await say(i, "[BROADCAST] " + arg); n += 1
+            try: await say(i, "Рассылка: " + arg); n += 1
             except Exception: pass
             await asyncio.sleep(0.05)
-        return f"[BROADCAST] доставлено {n}"
+        return f"Рассылка: доставлено {n}"
     return status_text()
 
 def pick_photo(m):
@@ -1383,7 +1390,7 @@ async def handle_photo(m, uid):
     if blk: return await say(uid, blk)
     cap = (m.get("caption") or "").strip() or "Опиши, что на изображении, и ответь по делу."
     blob, path = await busy(uid, tg_download(pick_photo(m), IMG_MAX))
-    if blob is None: return await say(uid, "[ERROR] не смог скачать фото (возможно, слишком большое, лимит 5 МБ)")
+    if blob is None: return await say(uid, "Ошибка: не смог скачать фото (возможно, слишком большое, лимит 5 МБ)")
     mime = "image/png" if path.lower().endswith(".png") else "image/jpeg"
     sid = f"tg:{uid}"
     out = await busy(uid, llm(hload(sid)[-6:] + [{"role": "user", "content": [{"type": "text", "text": cap},
@@ -1397,7 +1404,7 @@ async def handle(m):
     row = q("select banned from users where id=?", uid)
     if not row:
         q("insert into users values(?,?,0,?)", uid, u.get("first_name", ""), dt.datetime.now().isoformat())
-        await say(ADMIN, f"[NEW USER] {uid} {u.get('first_name', '')}")
+        await say(ADMIN, f"Новый пользователь: {uid} {u.get('first_name', '')}")
     elif row[0][0] and not is_tester(uid): return
     act(uid, ("фото" if pick_photo(m) else "файл") if not txt else txt.split()[0].split("@")[0].lower() if txt.startswith("/") else f"сообщение, {len(txt)} симв.")
     if await spam(uid, txt): return
@@ -1417,14 +1424,15 @@ async def handle(m):
     if cmd == "/import": return await r("Пришли файл (md, json или txt) с подписью /import. Понимаю выгрузку этого бота, экспорт Claude и ChatGPT и текст с метками Пользователь и Ассистент. /import add добавляет к текущему диалогу, без add заменяет его.")
     if cmd == "/premium": return await r("Premium пока в разработке. Когда появится, напишу в /updates.")
     if cmd == "/start":
-        mk = {"inline_keyboard": MENU["inline_keyboard"] + ([[{"text": "🚨 Тревога", "callback_data": "/panic"}]] if uid == ADMIN else [])}
-        return await r("Привет! Выбери действие или просто напиши вопрос:", reply_markup=mk)
+        return await r("Привет! Просто напиши вопрос обычным сообщением.\n\n" + cmds_text(uid), reply_markup=({"inline_keyboard": [[{"text": "🚨 Тревога", "callback_data": "/panic"}]]} if uid == ADMIN else None))
+    if cmd == "/menu": return await r(HELP, reply_markup=help_kb(uid))
     if cmd == "/help":
         tp = arg.lower().split()[0] if arg else ""
+        if not tp: return await r(cmds_text(uid))
         if tp == "ideas" and not (uid == ADMIN or is_tester(uid)): tp = ""
         if tp == "admin" and uid == ADMIN: return await r(admin_section(""), reply_markup=ADM_KB)
         return await r(HELP_TOPICS.get(tp, HELP), reply_markup=help_kb(uid))
-    if cmd == "/clear": q("delete from hist where sid=?", sid); return await r("[OK] чат очищен")
+    if cmd == "/clear": q("delete from hist where sid=?", sid); return await r("чат очищен")
     if cmd == "/news":
         if arg == "ps99" and uid == ADMIN: return await r(await ps99())
         items = await collect(uid, False)
@@ -1440,14 +1448,14 @@ async def handle(m):
         if uid != ADMIN and q("select count(*) from sources where owner=?", uid)[0][0] >= 5: return await r("Лимит 5 своих источников. /delsource N")
         try:
             k, u = await norm_source(arg); its = await fetch_items(k, u)
-        except Exception as e: return await r(f"[ERROR] {e}")
-        if not its: return await r("[ERROR] по этой ссылке новостей не нашёл")
+        except Exception as e: return await r(f"Ошибка: {e}")
+        if not its: return await r("Ошибка: по этой ссылке новостей не нашёл")
         q("insert or ignore into sources(owner,kind,url,title) values(?,?,?,?)", own, k, u, arg[:40])
-        return await r(f"[OK] добавлен ({k}), новостей найдено: {len(its)}" + (" (общий, виден всем)" if own == 0 else (" (только твой)" if uid == ADMIN else "")))
+        return await r(f"добавлен ({k}), новостей найдено: {len(its)}" + (" (общий, виден всем)" if own == 0 else (" (только твой)" if uid == ADMIN else "")))
     if cmd == "/delsource" and arg.isdigit():
         row = q("select title,url from sources where id=? and (owner=? or ?)", int(arg), uid, uid == ADMIN)
         if not row: return await r("Не нашёл твой источник с таким номером. Список: /sources")
-        q("delete from sources where id=?", int(arg)); return await r(f"[OK] удалён источник: {row[0][0]} ({row[0][1][:60]})")
+        q("delete from sources where id=?", int(arg)); return await r(f"удалён источник: {row[0][0]} ({row[0][1][:60]})")
     if cmd in ("/sub", "/time", "/format"):
         ensure_sub(uid)
         if cmd == "/sub" and arg in ("on", "off"):
@@ -1480,22 +1488,22 @@ async def handle(m):
         if panic(): return await r("[ТРЕВОГА] рассылки остановлены. /panic off - выключить режим")
         if not arg: return await r("Всем сразу: /post текст\nНа время: /post 18:30 текст\nНа дату: /post 05.11 18:30 текст")
         try: w, t = parse_when(arg)
-        except ValueError: return await r("[ERROR] неверная дата")
+        except ValueError: return await r("Ошибка: неверная дата")
         q("insert into posts(at,text) values(?,?)", w.strftime("%Y-%m-%d %H:%M"), t)
         asyncio.create_task(job_posts())
-        return await r(f"[OK] запланировано на {w:%d.%m %H:%M} МСК" if w > dt.datetime.now(MSK) else "[OK] отправляю всем")
+        return await r(f"запланировано на {w:%d.%m %H:%M} МСК" if w > dt.datetime.now(MSK) else "отправляю всем")
     if uid == ADMIN and cmd == "/posts":
         return await r("\n".join(f"{i}. {a} - {t[:60]}" for i, a, t in q("select id,at,text from posts where sent=0 order by at")) or "запланированных нет")
     if uid == ADMIN and cmd == "/delpost" and arg.isdigit():
-        q("delete from posts where id=? and sent=0", int(arg)); return await r("[OK] удалено")
+        q("delete from posts where id=? and sent=0", int(arg)); return await r("удалено")
     if uid == ADMIN and cmd == "/setbackup":
         if m.get("message_id"): await tg("deleteMessage", json={"chat_id": uid, "message_id": m["message_id"]})
         if not arg: return await r("Пришли: /setbackup ТОКЕН_БОТА_БЭКАПОВ (сообщение удалю). Сначала открой этого бота и нажми /start.")
         me = await tg("getMe", arg)
-        if not me.get("ok"): return await r("[ERROR] токен не подошёл")
+        if not me.get("ok"): return await r("Ошибка: токен не подошёл")
         q("insert or replace into settings values('backup_token',?)", arg)
         err = await job_backup(force=True)
-        return await r(f"[OK] бот бэкапов @{me['result']['username']} привязан. " + (f"\n[BACKUP ERROR] {err}\nОткрой его, нажми /start, потом /admin backup" if err else "Тестовый бэкап отправлен.")
+        return await r(f"бот бэкапов @{me['result']['username']} привязан. " + (f"\n🚨 Ошибка бэкапа: {err}\nОткрой его, нажми /start, потом /admin backup" if err else "Тестовый бэкап отправлен.")
                        + "\nЧтобы это пережило перезапуск, добавь токен в Render как BACKUP_BOT_TOKEN.")
     if cmd == "/nick":
         if uid != ADMIN: return await r("Не знаю такой команды. /help")
@@ -1512,17 +1520,17 @@ async def handle(m):
     if uid == ADMIN and cmd == "/acc":
         sub, _, a = arg.partition(" ")
         if sub == "add" and a:
-            q("insert or ignore into accs values(?)", a.strip()); t, _ = await inv_report(a.strip()); return await r("[OK] добавлен\n" + t)
-        if sub == "del" and a: q("delete from accs where nick=?", a.strip()); return await r("[OK] удалён")
+            q("insert or ignore into accs values(?)", a.strip()); t, _ = await inv_report(a.strip()); return await r("добавлен\n" + t)
+        if sub == "del" and a: q("delete from accs where nick=?", a.strip()); return await r("удалён")
         return await r("\n".join(n for (n,) in q("select nick from accs")) or "аккаунтов нет. /acc add НикRoblox")
     if uid == ADMIN and cmd == "/new":
-        await ps99_new(); return await r("[OK] проверил. Если что-то новое есть, пришлю отдельным сообщением")
+        await ps99_new(); return await r("проверил. Если что-то новое есть, пришлю отдельным сообщением")
     if uid == ADMIN and cmd == "/inv":
         sub, _, a = arg.partition(" ")
         if sub == "add" and a:
             mm = re.match(r"^(.+?)\s+(\d+)$", a); n, qty = (mm.group(1), int(mm.group(2))) if mm else (a, 1)
-            q("insert into inv values(?,?) on conflict(name) do update set qty=qty+?", n.lower(), qty, qty); return await r(f"[OK] {n} x{qty}")
-        if sub == "del" and a: q("delete from inv where name=?", a.lower()); return await r("[OK] удалено")
+            q("insert into inv values(?,?) on conflict(name) do update set qty=qty+?", n.lower(), qty, qty); return await r(f"{n} x{qty}")
+        if sub == "del" and a: q("delete from inv where name=?", a.lower()); return await r("удалено")
         accs = [n for (n,) in q("select nick from accs")]
         if accs and not sub: return await r("\n\n".join([(await inv_report(n))[0] for n in accs]))
         rows = q("select name,qty from inv")
@@ -1533,20 +1541,20 @@ async def handle(m):
             v = d.get(n, 0) * qn; tot += v; lines.append(f"{n} x{qn}: {v:,}" if v else f"{n} x{qn}: цена не найдена")
         return await r("\n".join(lines) + f"\n\nИтого RAP: {tot:,}" if rows else "пусто. Пример: /inv add huge cat golden 2")
     if cmd == "/mc":
-        if uid != ADMIN: return await r("[ACCESS DENIED] только для админа")
+        if uid != ADMIN: return await r("Доступ закрыт. только для админа")
         if not arg: return await r("Пример: /mc средневековая башня 9x9 из булыжника с крышей")
-        await r("[MC] генерирую..."); info, blob = await mc(uid, arg)
+        await r("Схема: генерирую..."); info, blob = await mc(uid, arg)
         if blob: await tg("sendDocument", data={"chat_id": uid, "caption": info}, files={"document": ("build.schem", blob)})
         else: await r(info)
         return
     if cmd == "/agent":
-        hist_pref[uid] = None if arg in ("", "auto") else arg; return await r(f"[AGENT] {arg or 'auto'}")
+        hist_pref[uid] = None if arg in ("", "auto") else arg; return await r(f"Режим: {arg or 'auto'}")
     if cmd == "/link":
         c = str(random.randint(100000, 999999)); pending[c] = (uid, time.time() + 600)
-        return await r(f"[LINK] Код {c} (10 минут). В веб-терминале введи: /link {c}")
+        return await r(f"Связка с сайтом: Код {c} (10 минут). В веб-терминале введи: /link {c}")
     if cmd == "/migrate_chat":
         s = " | ".join(x["content"][:150] for x in hist_load_tail(sid)) or "пусто"
-        q("delete from hist where sid=?", sid); hadd(sid, "user", "Контекст из прошлого чата: " + s); return await r("[MIGRATED] " + s)
+        q("delete from hist where sid=?", sid); hadd(sid, "user", "Контекст из прошлого чата: " + s); return await r("Перенесено: " + s)
     if cmd in ("/idea", "/ideas") and (uid == ADMIN or is_tester(uid)):
         if cmd == "/ideas" or not arg: return await r(ideas_text() + ("" if cmd == "/ideas" else "\nПредложить: /idea текст"))
         if len(arg) > 500: return await r("Идея длинновата, уложись в 500 символов.")
@@ -1601,10 +1609,10 @@ async def handle(m):
             if len(ks) >= 5: return await r("Лимит 5 ключей. /key del N")
             try: q("insert into keys values(?,?)", uid, enc(new, uid))
             except ValueError: return await r("Не получилось сохранить ключ, напиши админу.")
-            return await r("[OK] ключ добавлен (хранится зашифрованным), сообщение удалено. Модель выберется сама, сменить: /model")
-        if sub == "del" and a.isdigit() and 0 < int(a) <= len(ks): q("delete from keys where rowid=?", ks[int(a) - 1][0]); return await r("[OK] удалён")
-        if sub == "sessions": return await r(f"[SESSIONS] привязано веб-устройств: {q('select count(*) from links where uid=?', uid)[0][0]}")
-        if sub == "unlink": q("delete from links where uid=?", uid); return await r("[OK] веб-сессии отвязаны")
+            return await r("ключ добавлен (хранится зашифрованным), сообщение удалено. Модель выберется сама, сменить: /model")
+        if sub == "del" and a.isdigit() and 0 < int(a) <= len(ks): q("delete from keys where rowid=?", ks[int(a) - 1][0]); return await r("удалён")
+        if sub == "sessions": return await r(f"Веб-устройства: привязано веб-устройств: {q('select count(*) from links where uid=?', uid)[0][0]}")
+        if sub == "unlink": q("delete from links where uid=?", uid); return await r("веб-сессии отвязаны")
         return await r("\n".join(f"{i}. {mask(k)}" for i, (_, k) in enumerate(ks, 1)) or "ключей нет. /key providers")
     if uid == ADMIN and (cmd == "/admin" or cmd[1:] in ADMIN_SUBS):
         sub, a = (arg.split(" ", 1) + [""])[:2] if cmd == "/admin" else (cmd[1:], arg)
@@ -1660,7 +1668,7 @@ async def job_streams(_=None):
                 x = (await c.get("https://www.youtube.com/feeds/videos.xml?channel_id=" + ch)).text
                 vid = re.search(r"<yt:videoId>(.*?)</yt:videoId>", x).group(1); title = re.findall(r"<title>(.*?)</title>", x)[1]
             except Exception: continue
-            if ch in last_yt and last_yt[ch] != vid: await say(ADMIN, f"[YOUTUBE] {title}\nhttps://youtu.be/{vid}")
+            if ch in last_yt and last_yt[ch] != vid: await say(ADMIN, f"YouTube: {title}\nhttps://youtu.be/{vid}")
             last_yt[ch] = vid
         cid, sec, us = E("TWITCH_ID"), E("TWITCH_SECRET"), [x for x in E("TWITCH_USERS", "").split(",") if x]
         if cid and sec and us:
@@ -1670,7 +1678,7 @@ async def job_streams(_=None):
             except Exception: return
             live = {s["user_login"]: s["title"] for s in d}
             for n, tt in live.items():
-                if n not in live_tw: await say(ADMIN, f"[TWITCH LIVE] {n}: {tt}")
+                if n not in live_tw: await say(ADMIN, f"Twitch в эфире: {n}: {tt}")
             live_tw.clear(); live_tw.update(live)
 
 # ---------- Бэкапы: ТОЛЬКО в отдельного бота-сейвера ----------
@@ -1802,7 +1810,7 @@ async def start():
     if BOT: asyncio.create_task(set_menu())
     if BOT:
         asyncio.create_task(poll()); asyncio.create_task(startup_report(rs))
-PUB_CMDS = [("start", "Меню"), ("help", "Помощь по темам"), ("news", "Новости сейчас"), ("subscribe", "Рассылка вкл/выкл"), ("newstime", "Время рассылки"),
+PUB_CMDS = [("start", "Список команд"), ("help", "Команды и справка"), ("menu", "Меню по темам"), ("news", "Новости сейчас"), ("subscribe", "Рассылка вкл/выкл"), ("newstime", "Время рассылки"),
             ("newsformat", "Формат новостей"), ("sources", "Откуда новости"), ("removesource", "Убрать свой источник"), ("apikey", "Свой ключ ИИ"),
             ("model", "Выбор модели"), ("models", "Список бесплатных моделей"), ("mode", "Режим ИИ"), ("img", "Нарисовать картинку"), ("export", "Выгрузить диалог"),
             ("newchat", "Новый чат с памятью"), ("clear", "Очистить диалог"), ("link", "Связать с сайтом"), ("whatsnew", "Что нового"), ("rules", "Правила"), ("premium", "Premium (скоро)")]
@@ -1825,26 +1833,26 @@ def web_sid(cid, chat):
     return (f"tg:{r[0][0]}", r[0][0]) if r else (f"web:{cid}:{chat}", 0)
 @app.post("/api/chat")
 async def chat(req: Request):
-    if panic(): return JSONResponse({"reply": "[MAINTENANCE] сервис временно недоступен"}, 503)
+    if panic(): return JSONResponse({"reply": "сервис временно недоступен"}, 503)
     ip, now = req.headers.get("x-forwarded-for", req.client.host).split(",")[0], time.time()
     ipc[ip] = [t for t in ipc.get(ip, []) if t > now - 60]
-    if len(ipc[ip]) >= 20: return JSONResponse({"reply": "[RATE LIMIT REACHED]: Лимит исчерпан. Восстановление через 1 минут."}, 429)
+    if len(ipc[ip]) >= 20: return JSONResponse({"reply": "Лимит исчерпан. Восстановление через 1 минуту."}, 429)
     ipc[ip].append(now); b = await req.json()
     text = str(b.get("text", ""))[:6000]; cid = str(b.get("cid", ""))[:40]
-    if not text or not cid: return JSONResponse({"reply": "[ERROR] пустой запрос"}, 400)
+    if not text or not cid: return JSONResponse({"reply": "Ошибка: пустой запрос"}, 400)
     sid, uid = web_sid(cid, str(b.get("chat", ""))[:20])
-    if uid and q("select banned from users where id=?", uid) == [(1,)]: return JSONResponse({"reply": "[BANNED]"}, 403)
+    if uid and q("select banned from users where id=?", uid) == [(1,)]: return JSONResponse({"reply": "Доступ закрыт. "}, 403)
     blk = await screen(uid, text)
     if blk: return {"reply": blk}
     return {"reply": await reply(sid, uid, text, hist_pref.get(uid))}
 @app.post("/api/link")
 async def link(req: Request):
-    if panic(): return JSONResponse({"reply": "[MAINTENANCE] сервис временно недоступен"}, 503)
+    if panic(): return JSONResponse({"reply": "сервис временно недоступен"}, 503)
     b = await req.json(); p = pending.get(str(b.get("code", "")))
-    if not p or p[1] < time.time(): return JSONResponse({"reply": "[LINK ERROR] код неверен или истёк"}, 400)
+    if not p or p[1] < time.time(): return JSONResponse({"reply": "Ошибка связки: код неверен или истёк"}, 400)
     q("insert or replace into links values(?,?)", str(b.get("cid", ""))[:40], p[0]); pending.pop(str(b["code"]), None)
-    await say(p[0], "[LINK] Веб-терминал привязан: история общая.")
-    return {"reply": "[LINK OK] история теперь общая с Telegram"}
+    await say(p[0], "Связка с сайтом: Веб-терминал привязан: история общая.")
+    return {"reply": "Связано: история теперь общая с Telegram"}
 @app.post("/api/admin/{sub}")
 async def adm(sub: str, req: Request):
     if not ADMIN_TOKEN or not hmac.compare_digest(req.headers.get("x-admin-token", ""), ADMIN_TOKEN): return JSONResponse({"error": "forbidden"}, 403)
