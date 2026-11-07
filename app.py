@@ -282,6 +282,8 @@ def startup_rotate():
     """При старте: если отпечаток ENC_KEY изменился и есть ENC_KEY_OLD, бот сам перешифровывает."""
     if not MK:
         return "ENC_KEY не задан: шифрование выключено, /apikey_add не сохраняет ключи."
+    if not AESGCM:
+        return "ВНИМАНИЕ: ENC_KEY задан, но библиотека cryptography не установлена. Шифрование ВЫКЛЮЧЕНО, ключи не сохраняются. Проверь requirements.txt на GitHub и сделай Manual Deploy."
     fp = hashlib.sha256(MK).hexdigest()[:16]; old = getv("mk_fp")
     if old is None:
         setv("mk_fp", fp); return "Шифрование включено."
