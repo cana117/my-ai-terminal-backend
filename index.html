@@ -1,72 +1,155 @@
 <!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MY_AI // TERMINAL</title>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>MY_AI</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
-:root{--bg:#07090b;--fg:#b7f5c4;--dim:#4f6b57;--acc:#3dff8a;--me:#7fd4ff;--err:#ff6b6b;--line:#16231a}
-*{box-sizing:border-box}html,body{height:100%;margin:0}body{height:100vh;height:100dvh}
-body{background:var(--bg);color:var(--fg);font:14px/1.55 ui-monospace,Menlo,Consolas,monospace;display:flex}
-aside{width:230px;border-right:1px solid var(--line);padding:12px;overflow:auto;flex:none}
-aside button{display:block;width:100%;text-align:left;background:none;border:0;color:var(--dim);font:inherit;padding:5px 6px;cursor:pointer}
-aside button.on,aside button:hover{color:var(--acc)}
-main{flex:1;display:flex;flex-direction:column;min-width:0}
-header{padding:10px 16px;border-bottom:1px solid var(--line);color:var(--acc);display:flex;gap:12px;align-items:center}
-header span{color:var(--dim);flex:1}
-#log{flex:1;overflow:auto;padding:16px;white-space:pre-wrap;word-break:break-word}
-.u{color:var(--me)}.a{color:var(--fg)}.s{color:var(--dim)}
-.u::before{content:"> "}.a::before{content:"MY_AI: ";color:var(--acc)}
-#log div{margin-bottom:12px;max-width:90ch}
+:root{--bg:#07090b;--fg:#b7f5c4;--dim:#5d7a66;--acc:#3dff8a;--me:#7fd4ff;--err:#ff7b7b;--line:#16231a;color-scheme:dark}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:14px/1.55 ui-monospace,Menlo,Consolas,monospace;display:flex;flex-direction:column;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+nav{display:flex;gap:4px;border-bottom:1px solid var(--line);padding:6px 10px;align-items:center}
+nav button{background:none;border:0;color:var(--dim);font:inherit;padding:6px 10px;cursor:pointer}
+nav button.on{color:var(--acc);border-bottom:2px solid var(--acc)}
+nav span{margin-left:auto;color:var(--dim);font-size:12px}
+section{display:none;flex:1;min-height:0;flex-direction:column}
+section.on{display:flex}
+.log{flex:1;overflow:auto;padding:14px;white-space:pre-wrap;word-break:break-word}
+.log div{margin-bottom:12px;max-width:90ch}
+.u{color:var(--me)}.u::before{content:"> "}
+.a::before{content:"MY_AI: ";color:var(--acc)}
+.s{color:var(--dim)}.e{color:var(--err)}
 form{display:flex;border-top:1px solid var(--line)}
-form b{color:var(--acc);padding:12px 0 12px 16px}
-input{flex:1;background:none;border:0;color:var(--fg);font:inherit;font-size:16px;padding:12px 8px;outline:0}
-button:focus-visible,input:focus-visible{outline:1px solid var(--acc)}
-#tg{display:none;background:none;border:1px solid var(--line);color:var(--acc);font:inherit;cursor:pointer}
-@media(max-width:700px){aside{display:none;position:absolute;inset:44px 0 0 0;width:auto;background:var(--bg);z-index:2}aside.open{display:block}#tg{display:block}}
+form b{color:var(--acc);padding:12px 0 12px 14px}
+input{flex:1;background:none;border:0;color:var(--fg);font:inherit;font-size:16px;padding:12px 8px;outline:0;min-width:0}
+button:focus-visible,input:focus-visible,a:focus-visible{outline:1px solid var(--acc)}
+.tools{display:flex;gap:8px;padding:8px 14px;border-bottom:1px solid var(--line)}
+.tools button{background:none;border:1px solid var(--line);color:var(--acc);font:inherit;padding:4px 10px;cursor:pointer}
+.tools button.on{border-color:var(--acc)}
+.card{border-bottom:1px solid var(--line);padding:12px 0;display:flex;gap:12px}
+.card img{width:84px;height:84px;object-fit:cover;flex:none;background:var(--line)}
+.card h3{margin:0 0 4px;font-size:14px;font-weight:600}
+.card a{color:var(--fg)}
+.card p{margin:0;color:var(--dim)}
+#nl{padding:0 14px}
+#more{margin:12px 14px}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
 </style></head><body>
-<aside id="side"><button onclick="neu()">+ новый чат</button><div id="list"></div><button onclick="clr()">/clear</button></aside>
-<main>
-<header><button id="tg" onclick="side.classList.toggle('open')">чаты</button>MY_AI // MINI APP<span id="hol"></span></header>
-<div id="log" aria-live="polite"></div>
-<form onsubmit="send(event)"><b>&gt;</b><input id="inp" autocomplete="off" autofocus aria-label="Сообщение"></form>
-</main>
+<nav>
+  <button id="t-chat" class="on">чат</button>
+  <button id="t-news">новости</button>
+  <button id="t-term">терминал</button>
+  <span id="ver"></span>
+</nav>
+
+<section id="p-chat" class="on">
+  <div class="log" id="clog" aria-live="polite"></div>
+  <form id="cform"><b>&gt;</b><input id="cin" autocomplete="off" aria-label="Сообщение"></form>
+</section>
+
+<section id="p-news">
+  <div class="tools"><button id="l-ru" class="on">русские</button><button id="l-en">английские</button></div>
+  <div class="log" id="nlog"><div id="nl"></div><button id="more" class="tools" hidden>ещё</button></div>
+</section>
+
+<section id="p-term">
+  <div class="log" id="tlog"></div>
+  <form id="tform"><b>$</b><input id="tin" autocomplete="off" autocapitalize="off" aria-label="Команда"></form>
+</section>
+
 <script>
-// Инициализация Telegram WebApp
-let tg = window.Telegram?.WebApp;
-if (tg) {
-  tg.expand();
-  tg.ready();
+"use strict";
+const $ = s => document.querySelector(s);
+const tg = window.Telegram && window.Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+const INIT = tg ? tg.initData : "";
+const KEYRE = /(sk-or-|sk-|gsk_|AIza|nvapi-|hf_)[A-Za-z0-9_\-]{16,}/;
+
+// Хранилище только для удобства (в try/catch: может быть недоступно)
+const st = { get(k) { try { return localStorage.getItem(k) } catch (e) { return null } }, set(k, v) { try { localStorage.setItem(k, v) } catch (e) {} } };
+let CID = st.get("cid") || "";
+if (CID.length < 32) { CID = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, "0")).join(""); st.set("cid", CID); }
+
+async function api(path, body, extra) {
+  const h = Object.assign({ "Content-Type": "application/json", "X-Init-Data": INIT }, extra || {});
+  const opt = body ? { method: "POST", headers: h, body: JSON.stringify(body) } : { headers: h };
+  const r = await fetch(path, opt);
+  let j = {}; try { j = await r.json() } catch (e) {}
+  return { ok: r.ok, status: r.status, j };
+}
+function add(log, cls, text) {
+  const d = document.createElement("div"); d.className = cls; d.textContent = text;
+  log.append(d); log.scrollTop = log.scrollHeight; return d;
 }
 
-const $=s=>document.querySelector(s);
-let CID='';try{CID=localStorage.getItem('cid')||''}catch(e){}
-if(CID.length<32){CID=Array.from(crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join('');try{localStorage.setItem('cid',CID)}catch(e){}}
-let S={},cur;
-try{S=JSON.parse(localStorage.getItem('chats')||'{}')}catch(e){}
-const save=()=>{try{localStorage.setItem('chats',JSON.stringify(S))}catch(e){}};
-function neu(){cur=Date.now()+'';S[cur]={t:'новый чат',m:[]};save();draw();side.classList.remove('open')}
-function clr(){S[cur].m=[];S[cur].t='новый чат';save();draw()}
-function draw(){
-  const l=$('#list');l.textContent='';
-  Object.keys(S).reverse().forEach(id=>{const b=document.createElement('button');b.textContent=S[id].t;b.className=id==cur?'on':'';b.onclick=()=>{cur=id;draw();side.classList.remove('open')};l.append(b)});
-  const g=$('#log');g.textContent='';
-  if(!S[cur]){neu();return}
-  if(!S[cur].m.length)add('s','Telegram Mini App запущен. Вводи текст или команды.');
-  S[cur].m.forEach(m=>add(m.role=='user'?'u':'a',m.content));
-  g.scrollTop=g.scrollHeight;
+// Вкладки
+for (const n of ["chat", "news", "term"]) {
+  $("#t-" + n).onclick = () => {
+    for (const m of ["chat", "news", "term"]) { $("#t-" + m).classList.toggle("on", m === n); $("#p-" + m).classList.toggle("on", m === n); }
+    if (n === "news" && !$("#nl").children.length) loadNews(true);
+    if (n === "term" && !tlogInit) initTerm();
+  };
 }
-function add(c,t){const e=document.createElement('div');e.className=c;e.textContent=t;$('#log').append(e);return e}
-async function send(ev){
-  ev.preventDefault();const v=inp.value.trim();if(!v)return;inp.value='';
-  const c=S[cur];c.m.push({role:'user',content:v});if(c.m.length==1)c.t=v.slice(0,24);draw();
-  add('s','обработка…');
-  try{
-    const ac=new AbortController(),to=setTimeout(()=>ac.abort(),90000);
-    const r=await fetch((v.startsWith('/link ')?'/api/link':'/api/chat'),{method:'POST',signal:ac.signal,headers:{'Content-Type':'application/json'},body:JSON.stringify({cid:CID,chat:cur,text:v,code:v.slice(6).trim()})});
-    clearTimeout(to);
-    let j={};try{j=await r.json()}catch(e){}
-    c.m.push({role:'assistant',content:j.reply||(r.ok?'Пустой ответ.':'Сервер недоступен ('+r.status+'). Если он только проснулся, повтори через минуту.')});
-  }catch(e){c.m.push({role:'assistant',content:'Ошибка соединения с сервером. Если он только проснулся, повтори через минуту.'})}
-  save();draw();
+fetch("/api/health").then(r => r.json()).then(j => { $("#ver").textContent = j.version || ""; }).catch(() => {});
+
+// Чат
+add($("#clog"), "s", "Привет! Пиши сообщение. Ключи API сюда отправлять нельзя: только командой /apikey_add в Telegram.");
+$("#cform").onsubmit = async ev => {
+  ev.preventDefault(); const v = $("#cin").value.trim(); if (!v) return; $("#cin").value = "";
+  add($("#clog"), "u", v);
+  if (KEYRE.test(v)) return add($("#clog"), "e", "Так нельзя: ключи отправляй только командой /apikey_add в чате с ботом в Telegram.");
+  const w = add($("#clog"), "s", "обработка…");
+  try {
+    const { j } = await api("/api/chat", { cid: CID, text: v, chat: "main" });
+    w.className = "a"; w.textContent = j.reply || "Сервер недоступен. Если он только проснулся, повтори через минуту.";
+  } catch (e) { w.className = "e"; w.textContent = "Ошибка соединения."; }
+  $("#clog").scrollTop = $("#clog").scrollHeight;
+};
+
+// Новости
+let lang = "ru", offset = 0;
+for (const l of ["ru", "en"]) $("#l-" + l).onclick = () => { lang = l; $("#l-ru").classList.toggle("on", l === "ru"); $("#l-en").classList.toggle("on", l === "en"); loadNews(true); };
+$("#more").onclick = () => loadNews(false);
+function safeUrl(u) { return typeof u === "string" && u.startsWith("https://") ? u : ""; }
+async function loadNews(reset) {
+  if (reset) { offset = 0; $("#nl").textContent = ""; }
+  $("#more").hidden = true;
+  const { ok, j } = await api("/api/news?lang=" + lang + "&offset=" + offset).catch(() => ({ ok: false, j: {} }));
+  if (!ok) { $("#nl").textContent = "Не получилось загрузить новости."; return; }
+  const items = j.items || [];
+  if (!items.length && reset) $("#nl").textContent = "Новостей пока нет.";
+  for (const i of items) {
+    const c = document.createElement("div"); c.className = "card";
+    if (safeUrl(i.image)) { const im = document.createElement("img"); im.src = i.image; im.alt = ""; im.referrerPolicy = "no-referrer"; im.loading = "lazy"; im.onerror = () => im.remove(); c.append(im); }
+    const b = document.createElement("div"), h = document.createElement("h3"), p = document.createElement("p");
+    if (safeUrl(i.link)) { const a = document.createElement("a"); a.href = i.link; a.target = "_blank"; a.rel = "noopener noreferrer"; a.textContent = i.title; h.append(a); } else h.textContent = i.title;
+    p.textContent = (i.source || "") + " · " + new Date((i.time || 0) * 1000).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) + (i.desc ? "\n" + i.desc : "");
+    p.style.whiteSpace = "pre-wrap"; b.append(h, p); c.append(b); $("#nl").append(c);
+  }
+  offset += items.length; $("#more").hidden = items.length < 20;
 }
-if(!Object.keys(S).length)neu();else{cur=Object.keys(S).pop();draw()}
+
+// Терминал (только админ; в Telegram по подписи, на сайте по ADMIN_TOKEN, токен живёт только в памяти страницы)
+let tlogInit = false, TOKEN = "", hist = [], hi = 0;
+function initTerm() {
+  tlogInit = true;
+  add($("#tlog"), "s", INIT ? "Терминал. Введи /help или текст." : "Терминал. Введи ADMIN_TOKEN (он не сохраняется), потом команды.");
+}
+$("#tform").onsubmit = async ev => {
+  ev.preventDefault(); const v = $("#tin").value.trim(); if (!v) return; $("#tin").value = "";
+  if (!INIT && !TOKEN) { TOKEN = v; return add($("#tlog"), "s", "Токен принят в память страницы. Теперь команды."); }
+  hist.push(v); hi = hist.length; add($("#tlog"), "u", v);
+  if (KEYRE.test(v)) return add($("#tlog"), "e", "Так нельзя: ключи только через /apikey_add в Telegram.");
+  const w = add($("#tlog"), "s", "…");
+  try {
+    const { ok, j } = await api("/api/term", { text: v }, TOKEN ? { "X-Admin-Token": TOKEN } : {});
+    w.className = ok ? "a" : "e"; w.textContent = j.out || "(пусто)" + (j.sec ? "  [" + j.sec + " c]" : "");
+    if (!ok && !INIT) TOKEN = "";
+  } catch (e) { w.className = "e"; w.textContent = "Ошибка соединения."; }
+  $("#tlog").scrollTop = $("#tlog").scrollHeight;
+};
+$("#tin").onkeydown = e => {
+  if (e.key === "ArrowUp" && hi > 0) { $("#tin").value = hist[--hi]; e.preventDefault(); }
+  if (e.key === "ArrowDown" && hi < hist.length) { $("#tin").value = hist[++hi] || ""; e.preventDefault(); }
+};
 </script></body></html>
