@@ -13,10 +13,22 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+CRYPTO_ERR = ""
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-except Exception:  # без cryptography шифрование выключено, бот честно об этом скажет
-    AESGCM = None
+except Exception as _e:  # без cryptography шифрование выключено, бот честно об этом скажет
+    AESGCM = None; CRYPTO_ERR = repr(_e)[:300]
+    if os.environ.get("AUTO_INSTALL") == "1":
+        # ВРЕМЕННАЯ мера, выключена по умолчанию: ставит ОДИН фиксированный пакет. Правильное решение: Build Command = pip install -r requirements.txt
+        try:
+            import subprocess, sys, site, importlib
+            subprocess.run([sys.executable, "-m", "pip", "install", "cryptography"], check=True, timeout=300, capture_output=True)
+            importlib.invalidate_caches()
+            if site.getusersitepackages() not in sys.path: sys.path.append(site.getusersitepackages())
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            CRYPTO_ERR = "поставлена при старте (AUTO_INSTALL), поправь Build Command"
+        except Exception as _e2:
+            AESGCM = None; CRYPTO_ERR += " | AUTO_INSTALL не помог: " + repr(_e2)[:200]
 
 VERSION = "alpha 0.01"
 # Правило версий: +0.01 малое обновление, +0.1 побольше, +1 крупное. Слово alpha остаётся, пока не скажешь «в beta».
@@ -283,7 +295,7 @@ def startup_rotate():
     if not MK:
         return "ENC_KEY не задан: шифрование выключено, /apikey_add не сохраняет ключи."
     if not AESGCM:
-        return "ВНИМАНИЕ: ENC_KEY задан, но библиотека cryptography не установлена. Шифрование ВЫКЛЮЧЕНО, ключи не сохраняются. Проверь requirements.txt на GitHub и сделай Manual Deploy."
+        return "ВНИМАНИЕ: ENC_KEY задан, но библиотека cryptography не установлена. Шифрование ВЫКЛЮЧЕНО, ключи не сохраняются. Причина: " + (CRYPTO_ERR or "неизвестна") + ". Проверь Build Command и requirements.txt, сделай Manual Deploy (или временно AUTO_INSTALL=1)."
     fp = hashlib.sha256(MK).hexdigest()[:16]; old = getv("mk_fp")
     if old is None:
         setv("mk_fp", fp); return "Шифрование включено."
@@ -2105,6 +2117,7 @@ async def daily_report():
 
 async def check_text():
     L = [f"Версия {VERSION}", "ENC_KEY: " + ("задан, шифрование включено" if VAULT else ("задан, но нет библиотеки cryptography" if MK else "НЕ ЗАДАН, шифрование выключено"))]
+    if CRYPTO_ERR: L.append("cryptography: " + CRYPTO_ERR)
     me = await tg("getMe"); L.append("Бот: " + ("ок @" + (me.get("result") or {}).get("username", "?") if me.get("ok") else "ошибка getMe"))
     if BACKUP_TOKEN: bm = await tg("getMe", BACKUP_TOKEN); L.append("Бот бэкапов: " + ("ок" if bm.get("ok") else "ошибка (нажми в нём /start)"))
     else: L.append("Бот бэкапов: не задан (BACKUP_BOT_TOKEN)")
