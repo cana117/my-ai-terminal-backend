@@ -30,9 +30,10 @@ except Exception as _e:  # без cryptography шифрование выключ
         except Exception as _e2:
             AESGCM = None; CRYPTO_ERR += " | AUTO_INSTALL не помог: " + repr(_e2)[:200]
 
-VERSION = "alpha 0.02"
+VERSION = "alpha 0.03"
 # Правило версий: +0.01 малое обновление, +0.1 побольше, +1 крупное. Слово alpha остаётся, пока не скажешь «в beta».
 CHANGELOG = [
+    ("alpha 0.03", "Запуск устойчивее: сбой одного шага не съедает сообщение о запуске, ошибки видны в нём."),
     ("alpha 0.02", "Бот показывает причину, если не работает шифрование; запасной AUTO_INSTALL."),
     ("alpha 0.01", "Первая версия: классы и списки, антиспам с задержками, ключи ИИ с шифрованием, новости, идеи, награды и подарки (с подтверждением), терминал. Заглушки: PS99, YouTube, Twitch, Minecraft, поиск в интернете, отправка звёзд и подарков."),
 ]
@@ -2595,6 +2596,7 @@ async def poll():
             if "Conflict" in str(r.get("description")): STAT["bot"] = "409: этот токен читает другой экземпляр бота"; log.error("409 Conflict")
             await asyncio.sleep(5); continue
         STAT["bot"] = "ок"
+        if not r.get("result"): await asyncio.sleep(0.2)  # страховка от «горячего» цикла
         for u in r.get("result", []):
             off = u["update_id"] + 1; asyncio.create_task(run(u))
 
@@ -2646,14 +2648,37 @@ async def set_menu():
 
 
 async def boot():
+    errs = []
+
+    async def step(name, aw, timeout=60):
+        """Каждый шаг запуска в защите: сбой одного не должен остановить остальное и молча съесть сообщение о запуске."""
+        try:
+            return await asyncio.wait_for(aw, timeout)
+        except Exception as e:
+            errs.append(f"{name}: {type(e).__name__} {str(e)[:120]}"); log.error("запуск, шаг %s: %s", name, scrub(traceback.format_exc())[-500:])
     log.info("старт %s; заданы: %s", VERSION, ", ".join(k for k in ("BOT_TOKEN", "ADMIN_ID", "ENC_KEY", "BACKUP_BOT_TOKEN", "TESTER_ID", "PROTECTED_IDS", "ADMIN_TOKEN", "WEB_ORIGIN") if E(k)) or "ничего")
-    if not BOT_TOKEN or not ADMIN: log.error("не заданы BOT_TOKEN или ADMIN_ID"); return
-    me = await tg("getMe")
-    if not me.get("ok"): log.error("getMe: %s", me.get("description")); STAT["bot"] = "ошибка getMe"
-    if q1("select count(*) from users")[0] == 0 and await restore_pinned(): log.info("восстановлено")
-    note = startup_rotate(); await set_menu()
+    if not BOT_TOKEN or not ADMIN:
+        log.error("не заданы BOT_TOKEN или ADMIN_ID"); return
+    me = await step("getMe", tg("getMe")) or {}
+    if not me.get("ok"): STAT["bot"] = "ошибка getMe"; errs.append("getMe: " + str(me.get("description")))
+    try:
+        if q1("select count(*) from users")[0] == 0: await step("restore", restore_pinned(), 120)
+    except Exception as e:
+        errs.append(f"restore: {e!r}"[:150])
+    note = ""
+    try: note = startup_rotate()
+    except Exception as e: errs.append(f"rotate: {e!r}"[:150])
+    await step("menu", set_menu())
     asyncio.create_task(scheduler()); asyncio.create_task(self_ping()); asyncio.create_task(poll())
-    await say(ADMIN, f"Бот запущен {VERSION}.\n{note}\n" + await check_text())
+    log.info("запуск: фоновые задачи стартовали")
+    try: text = f"Бот запущен {VERSION}.\n{note}\n" + await check_text()
+    except Exception as e: text = f"Бот запущен {VERSION}. (диагностика упала: {e!r})"[:300]
+    if errs: text += "\nОшибки запуска:\n" + "\n".join(errs)
+    r = await say(ADMIN, text)
+    if not r.get("ok"):
+        log.error("сообщение о запуске не отправилось: %s", r.get("description"))
+        if BACKUP_TOKEN:  # запасной путь: причину пришлёт бот бэкапов
+            await say(backup_chat(), "Основной бот не смог отправить сообщение о запуске: " + str(r.get("description")) + "\n" + text, BACKUP_TOKEN)
 
 
 if __name__ == "__main__":
